@@ -1,0 +1,27 @@
+{
+  "configurations": [
+    {
+      "name": "ESP-IDF",
+      "compilerPath": "D:\\app\\Espressif\\tools\\xtensa-esp-elf\\esp-13.2.0_20240530\\xtensa-esp-elf\\bin\\xtensa-esp32s3-elf-gcc.exe",
+      "compileCommands": "${config:idf.buildPath}/compile_commands.json",
+      "intelliSenseMode": "gcc-x86",
+      "includePath": [
+        "${workspaceFolder}/**",
+        "D:/app/Espressif/FrameWork/v5.3.4/esp-idf/components/**",
+        "D:/app/Espressif/FrameWork/v5.3.4/esp-idf/components/freertos/**",
+        "D:/app/Espressif/FrameWork/v5.3.4/esp-idf/components/esp_wifi/**",
+        "D:/app/Espressif/FrameWork/v5.3.4/esp-idf/components/esp_netif/**",
+        "D:/app/Espressif/FrameWork/v5.3.4/esp-idf/components/nvs_flash/**",
+        "D:/app/Espressif/FrameWork/v5.3.4/esp-idf/components/bt/**"
+      ],
+      "browse": {
+        "path": [
+          "${workspaceFolder}",
+          "D:/app/Espressif/FrameWork/v5.3.4/esp-idf/components"
+        ],
+        "limitSymbolsToIncludedHeaders": true
+      }
+    }
+  ],
+  "version": 4
+}
