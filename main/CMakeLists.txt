@@ -1,2 +1,18 @@
-idf_component_register(SRCS "main.c"
-                    INCLUDE_DIRS ".")
+idf_component_register(
+    SRCS
+        "main.c"
+        "app/app_start.c"
+        "middle/display_service.c"
+        "drives/epd_2in13.c"
+    INCLUDE_DIRS
+        "."
+        "app"
+        "middle"
+        "drives"
+        "common"
+    REQUIRES
+        esp_driver_gpio
+        esp_driver_spi
+        esp_driver_uart
+        esp_driver_i2c
+)
