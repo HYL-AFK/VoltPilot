@@ -2,7 +2,18 @@ idf_component_register(
     SRCS
         "main.c"
         "app/app_start.c"
+        "middle/adc_service.c"
+        "middle/app_state_service.c"
+        "middle/bms_protocol.c"
+        "middle/bms_service.c"
+        "middle/board_service.c"
+        "middle/diag_service.c"
         "middle/display_service.c"
+        "middle/fault_service.c"
+        "middle/stc_protocol.c"
+        "middle/stc_service.c"
+        "middle/ui_service.c"
+        "middle/watchdog_service.c"
         "drives/epd_2in13.c"
     INCLUDE_DIRS
         "."
@@ -15,4 +26,10 @@ idf_component_register(
         esp_driver_spi
         esp_driver_uart
         esp_driver_i2c
+        esp_driver_ledc
+        esp_adc
+        esp_app_format
+        esp_system
+        heap
+        nvs_flash
 )

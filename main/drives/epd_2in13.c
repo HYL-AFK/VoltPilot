@@ -1,13 +1,14 @@
 #include "epd_2in13.h"
 
 #include <inttypes.h>
-#include <stdio.h>
+#include <stdbool.h>
 #include <string.h>
 
 #include "driver/gpio.h"
 #include "driver/spi_master.h"
 #include "esp_check.h"
 #include "esp_log.h"
+#include "esp_rom_sys.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -15,9 +16,13 @@
 #include "vp_types.h"
 
 static const char *TAG = "epd_2in13";
-static spi_device_handle_t s_epd_spi;
 
-/* 统一封装延时，避免驱动层直接依赖 Tick 细节。 */
+#if !VP_EPD_USE_SOFTWARE_SPI
+static spi_device_handle_t s_epd_spi;
+#endif
+
+static uint8_t s_4color_compat[VP_EPD_BUFFER_SIZE];
+
 static void epd_delay_ms(uint32_t ms)
 {
     vTaskDelay(pdMS_TO_TICKS(ms));
@@ -25,18 +30,36 @@ static void epd_delay_ms(uint32_t ms)
 
 static esp_err_t epd_write_byte(uint8_t value)
 {
+#if VP_EPD_USE_SOFTWARE_SPI
+    gpio_set_level(VP_EPD_PIN_CS, 0);
+
+    for (int i = 0; i < 8; i++) {
+        gpio_set_level(VP_EPD_PIN_SCK, 0);
+        gpio_set_level(VP_EPD_PIN_MOSI, (value & 0x80) != 0);
+        esp_rom_delay_us(VP_EPD_SOFTWARE_SPI_DELAY_US);
+        gpio_set_level(VP_EPD_PIN_SCK, 1);
+        esp_rom_delay_us(VP_EPD_SOFTWARE_SPI_DELAY_US);
+        value <<= 1;
+    }
+
+    gpio_set_level(VP_EPD_PIN_CS, 1);
+    return ESP_OK;
+#else
     spi_transaction_t t = {
         .length = 8,
         .tx_buffer = &value,
     };
 
     return spi_device_polling_transmit(s_epd_spi, &t);
+#endif
 }
 
 static esp_err_t epd_send_command(uint8_t command)
 {
     gpio_set_level(VP_EPD_PIN_DC, 0);
-    return epd_write_byte(command);
+    esp_err_t err = epd_write_byte(command);
+    gpio_set_level(VP_EPD_PIN_DC, 1);
+    return err;
 }
 
 static esp_err_t epd_send_data_byte(uint8_t data)
@@ -47,173 +70,137 @@ static esp_err_t epd_send_data_byte(uint8_t data)
 
 static esp_err_t epd_send_data(const uint8_t *data, size_t len)
 {
-    if (len == 0) {
-        return ESP_OK;
-    }
-
-    spi_transaction_t t = {
-        .length = len * 8,
-        .tx_buffer = data,
-    };
-
     gpio_set_level(VP_EPD_PIN_DC, 1);
-    return spi_device_polling_transmit(s_epd_spi, &t);
-}
 
-static esp_err_t epd_send_fill(uint8_t value, size_t len)
-{
-    uint8_t chunk[64];
-    memset(chunk, value, sizeof(chunk));
-
-    while (len > 0) {
-        size_t send_len = len > sizeof(chunk) ? sizeof(chunk) : len;
-        ESP_RETURN_ON_ERROR(epd_send_data(chunk, send_len), TAG, "send fill failed");
-        len -= send_len;
+    for (size_t i = 0; i < len; i++) {
+        ESP_RETURN_ON_ERROR(epd_write_byte(data[i]), TAG, "send data byte failed");
     }
 
     return ESP_OK;
 }
 
-/* 常规等待：用于 reset、set window、power on 等阶段。 */
-static esp_err_t epd_wait_idle(const char *phase)
+static esp_err_t epd_send_command_data(uint8_t command, const uint8_t *data, size_t len, const char *phase)
+{
+    ESP_RETURN_ON_ERROR(epd_send_command(command), TAG, "%s cmd failed", phase);
+
+    for (size_t i = 0; i < len; i++) {
+        ESP_RETURN_ON_ERROR(epd_send_data_byte(data[i]), TAG, "%s data failed", phase);
+    }
+
+    ESP_LOGI(TAG, "init %s cmd=0x%02X len=%u", phase, command, (unsigned)len);
+    return ESP_OK;
+}
+
+static esp_err_t epd_wait_ready_high(const char *phase)
 {
     TickType_t start = xTaskGetTickCount();
     TickType_t timeout = pdMS_TO_TICKS(VP_EPD_BUSY_TIMEOUT_MS);
     int first_level = gpio_get_level(VP_EPD_PIN_BUSY);
 
-    while (gpio_get_level(VP_EPD_PIN_BUSY) == VP_EPD_BUSY_ACTIVE_LEVEL) {
+    while (gpio_get_level(VP_EPD_PIN_BUSY) == 0) {
         if ((xTaskGetTickCount() - start) >= timeout) {
-            ESP_LOGE(TAG, "%s BUSY timeout, level=%d", phase, gpio_get_level(VP_EPD_PIN_BUSY));
+            ESP_LOGE(TAG, "%s BUSY ready high timeout, first=%d level=%d",
+                     phase, first_level, gpio_get_level(VP_EPD_PIN_BUSY));
             return ESP_ERR_TIMEOUT;
         }
         epd_delay_ms(10);
     }
 
     uint32_t elapsed_ms = pdTICKS_TO_MS(xTaskGetTickCount() - start);
-    ESP_LOGI(TAG, "%s BUSY first=%d idle=%d elapsed=%" PRIu32 " ms",
-             phase, first_level, gpio_get_level(VP_EPD_PIN_BUSY), elapsed_ms);
+    ESP_LOGI(TAG, "%s BUSY ready high first=%d idle=1 elapsed=%" PRIu32 " ms",
+             phase, first_level, elapsed_ms);
     return ESP_OK;
 }
 
-/*
- * 刷新阶段单独统计是否真的出现过 BUSY。
- * 目前这块屏的核心问题是“命令发出了，但刷新没有进入忙态”，
- * 所以这里保留更细的诊断日志。
- */
-static esp_err_t epd_wait_idle_after_refresh(const char *phase, bool *busy_seen)
+static uint8_t epd_packed_color(uint8_t color)
 {
-    TickType_t start = xTaskGetTickCount();
-    TickType_t timeout = pdMS_TO_TICKS(VP_EPD_BUSY_TIMEOUT_MS);
-    int first_level = gpio_get_level(VP_EPD_PIN_BUSY);
+    color &= 0x03;
+    return (uint8_t)((color << 6) | (color << 4) | (color << 2) | color);
+}
 
-    *busy_seen = first_level == VP_EPD_BUSY_ACTIVE_LEVEL;
-    while (gpio_get_level(VP_EPD_PIN_BUSY) == VP_EPD_BUSY_ACTIVE_LEVEL) {
-        if ((xTaskGetTickCount() - start) >= timeout) {
-            ESP_LOGE(TAG, "%s BUSY timeout, level=%d", phase, gpio_get_level(VP_EPD_PIN_BUSY));
-            return ESP_ERR_TIMEOUT;
-        }
-        epd_delay_ms(10);
+static void epd_set_4color_pixel(uint8_t *image, int x, int y, uint8_t color)
+{
+    if (image == NULL || x < 0 || x >= VP_EPD_WIDTH || y < 0 || y >= VP_EPD_HEIGHT) {
+        return;
     }
 
-    uint32_t elapsed_ms = pdTICKS_TO_MS(xTaskGetTickCount() - start);
-    ESP_LOGI(TAG, "%s BUSY first=%d idle=%d elapsed=%" PRIu32 " ms seen=%d",
-             phase, first_level, gpio_get_level(VP_EPD_PIN_BUSY), elapsed_ms, *busy_seen);
-    return ESP_OK;
+    size_t offset = (size_t)y * VP_EPD_WIDTH_BYTES + (x / VP_EPD_PIXELS_PER_BYTE);
+    uint8_t shift = (uint8_t)(6 - (2 * (x % VP_EPD_PIXELS_PER_BYTE)));
+    image[offset] &= (uint8_t)~(0x03 << shift);
+    image[offset] |= (uint8_t)((color & 0x03) << shift);
 }
 
-/* 这类 122x250 屏常从最后一行开始写入，先把地址计数器归位。 */
-static esp_err_t epd_set_cursor_home(void)
-{
-    ESP_RETURN_ON_ERROR(epd_send_command(0x4E), TAG, "set x counter cmd failed");
-    ESP_RETURN_ON_ERROR(epd_send_data_byte(0x00), TAG, "set x counter failed");
-    ESP_RETURN_ON_ERROR(epd_send_command(0x4F), TAG, "set y counter cmd failed");
-    ESP_RETURN_ON_ERROR(epd_send_data_byte((VP_EPD_HEIGHT - 1) & 0xff), TAG, "set y counter l failed");
-    ESP_RETURN_ON_ERROR(epd_send_data_byte((VP_EPD_HEIGHT - 1) >> 8), TAG, "set y counter h failed");
-
-    return epd_wait_idle("set cursor");
-}
-
-/* 硬复位时序按更保守的脉宽处理，优先保证屏能被拉起。 */
 static esp_err_t epd_reset(void)
 {
-    gpio_set_level(VP_EPD_PIN_RST, 1);
     epd_delay_ms(100);
     gpio_set_level(VP_EPD_PIN_RST, 0);
     epd_delay_ms(10);
     gpio_set_level(VP_EPD_PIN_RST, 1);
-    epd_delay_ms(100);
+    epd_delay_ms(10);
 
-    return epd_wait_idle("hardware reset");
+    return epd_wait_ready_high("hardware reset");
 }
 
-/* 配置显示窗口，并把 RAM 光标移动到当前窗口首页。 */
-static esp_err_t epd_set_window(void)
+static esp_err_t epd_vendor_init_sequence(void)
 {
-    ESP_RETURN_ON_ERROR(epd_send_command(0x44), TAG, "set x range cmd failed");
-    ESP_RETURN_ON_ERROR(epd_send_data_byte(0x00), TAG, "set x range start failed");
-    ESP_RETURN_ON_ERROR(epd_send_data_byte(VP_EPD_WIDTH_BYTES - 1), TAG, "set x range end failed");
+    static const uint8_t cmd_4d[] = {0x78};
+    static const uint8_t cmd_00[] = {0x0F, 0x09};
+    static const uint8_t cmd_01[] = {0x07, 0x00, 0x22, 0x78, 0x0A, 0x22};
+    static const uint8_t cmd_03[] = {0x10, 0x54, 0x44};
+    static const uint8_t cmd_06[] = {0x0F, 0x0A, 0x2F, 0x25, 0x22, 0x2E, 0x21};
+    static const uint8_t cmd_30[] = {0x02};
+    static const uint8_t cmd_41[] = {0x00};
+    static const uint8_t cmd_50[] = {0x37};
+    static const uint8_t cmd_60[] = {0x02, 0x02};
+    static const uint8_t cmd_61[] = {
+        VP_EPD_SOURCE_BITS / 256,
+        VP_EPD_SOURCE_BITS % 256,
+        VP_EPD_GATE_BITS / 256,
+        VP_EPD_GATE_BITS % 256,
+    };
+    static const uint8_t cmd_65[] = {0x00, 0x00, 0x00, 0x00};
+    static const uint8_t cmd_e7[] = {0x1C};
+    static const uint8_t cmd_e3[] = {0x22};
+    static const uint8_t cmd_e0[] = {0x00};
+    static const uint8_t cmd_b4[] = {0xD0};
+    static const uint8_t cmd_b5[] = {0x03};
+    static const uint8_t cmd_e9[] = {0x01};
 
-    ESP_RETURN_ON_ERROR(epd_send_command(0x45), TAG, "set y range cmd failed");
-    ESP_RETURN_ON_ERROR(epd_send_data_byte(0x00), TAG, "set y range start l failed");
-    ESP_RETURN_ON_ERROR(epd_send_data_byte(0x00), TAG, "set y range start h failed");
-    ESP_RETURN_ON_ERROR(epd_send_data_byte((VP_EPD_HEIGHT - 1) & 0xff), TAG, "set y range end l failed");
-    ESP_RETURN_ON_ERROR(epd_send_data_byte((VP_EPD_HEIGHT - 1) >> 8), TAG, "set y range end h failed");
-
-    ESP_RETURN_ON_ERROR(epd_set_cursor_home(), TAG, "set cursor home failed");
-    return epd_wait_idle("set window");
+    ESP_RETURN_ON_ERROR(epd_send_command_data(0x4D, cmd_4d, sizeof(cmd_4d), "0x4D"), TAG, "0x4D failed");
+    ESP_RETURN_ON_ERROR(epd_send_command_data(0x00, cmd_00, sizeof(cmd_00), "0x00 panel setting"), TAG, "0x00 failed");
+    ESP_RETURN_ON_ERROR(epd_send_command_data(0x01, cmd_01, sizeof(cmd_01), "0x01 power setting"), TAG, "0x01 failed");
+    ESP_RETURN_ON_ERROR(epd_send_command_data(0x03, cmd_03, sizeof(cmd_03), "0x03 power off seq"), TAG, "0x03 failed");
+    ESP_RETURN_ON_ERROR(epd_send_command_data(0x06, cmd_06, sizeof(cmd_06), "0x06 booster"), TAG, "0x06 failed");
+    ESP_RETURN_ON_ERROR(epd_send_command_data(0x30, cmd_30, sizeof(cmd_30), "0x30 frame rate"), TAG, "0x30 failed");
+    ESP_RETURN_ON_ERROR(epd_send_command_data(0x41, cmd_41, sizeof(cmd_41), "0x41"), TAG, "0x41 failed");
+    ESP_RETURN_ON_ERROR(epd_send_command_data(0x50, cmd_50, sizeof(cmd_50), "0x50 vcom/data interval"), TAG, "0x50 failed");
+    ESP_RETURN_ON_ERROR(epd_send_command_data(0x60, cmd_60, sizeof(cmd_60), "0x60 tcon"), TAG, "0x60 failed");
+    ESP_RETURN_ON_ERROR(epd_send_command_data(0x61, cmd_61, sizeof(cmd_61), "0x61 resolution"), TAG, "0x61 failed");
+    ESP_RETURN_ON_ERROR(epd_send_command_data(0x65, cmd_65, sizeof(cmd_65), "0x65"), TAG, "0x65 failed");
+    ESP_RETURN_ON_ERROR(epd_send_command_data(0xE7, cmd_e7, sizeof(cmd_e7), "0xE7"), TAG, "0xE7 failed");
+    ESP_RETURN_ON_ERROR(epd_send_command_data(0xE3, cmd_e3, sizeof(cmd_e3), "0xE3"), TAG, "0xE3 failed");
+    ESP_RETURN_ON_ERROR(epd_send_command_data(0xE0, cmd_e0, sizeof(cmd_e0), "0xE0"), TAG, "0xE0 failed");
+    ESP_RETURN_ON_ERROR(epd_send_command_data(0xB4, cmd_b4, sizeof(cmd_b4), "0xB4"), TAG, "0xB4 failed");
+    ESP_RETURN_ON_ERROR(epd_send_command_data(0xB5, cmd_b5, sizeof(cmd_b5), "0xB5"), TAG, "0xB5 failed");
+    ESP_RETURN_ON_ERROR(epd_send_command_data(0xE9, cmd_e9, sizeof(cmd_e9), "0xE9"), TAG, "0xE9 failed");
+    return ESP_OK;
 }
 
-/*
- * 刷新流程保留多组候选命令，方便适配不同批次的 2.13 寸三色屏。
- * 如果所有命令都不触发 BUSY，基本可以判断当前控制器序列不匹配。
- */
 static esp_err_t epd_refresh(void)
 {
-    static const uint8_t update_controls[] = {
-        0xF7, /* 常见 SSD1680 全刷参数。 */
-        0xC7, /* 部分 2.13 寸屏使用的替代全刷参数。 */
-        0xFF, /* 对 UC8151/SSD168x 兼容屏更激进的刷新参数。 */
-    };
-
-    ESP_LOGI(TAG, "refresh try power on 0x04");
+    ESP_LOGI(TAG, "refresh 0x04/0x12 vendor flow");
     ESP_RETURN_ON_ERROR(epd_send_command(0x04), TAG, "power on cmd failed");
-    ESP_RETURN_ON_ERROR(epd_wait_idle("power on"), TAG, "power on busy failed");
+    ESP_RETURN_ON_ERROR(epd_wait_ready_high("refresh power on 0x04"), TAG, "power on busy failed");
 
-    for (size_t i = 0; i < sizeof(update_controls) / sizeof(update_controls[0]); i++) {
-        char phase[32];
-        bool busy_seen = false;
-
-        ESP_LOGI(TAG, "refresh try update_control=0x%02X", update_controls[i]);
-        ESP_RETURN_ON_ERROR(epd_send_command(0x22), TAG, "display update control cmd failed");
-        ESP_RETURN_ON_ERROR(epd_send_data_byte(update_controls[i]), TAG, "display update control data failed");
-        ESP_RETURN_ON_ERROR(epd_send_command(0x20), TAG, "master activate failed");
-        epd_delay_ms(20);
-
-        snprintf(phase, sizeof(phase), "refresh 0x%02X", update_controls[i]);
-        ESP_RETURN_ON_ERROR(epd_wait_idle_after_refresh(phase, &busy_seen), TAG, "refresh busy failed");
-        if (busy_seen) {
-            return ESP_OK;
-        }
-    }
-
-    {
-        bool busy_seen = false;
-
-        ESP_LOGI(TAG, "refresh try direct command 0x12");
-        ESP_RETURN_ON_ERROR(epd_send_command(0x12), TAG, "direct refresh cmd failed");
-        epd_delay_ms(20);
-        ESP_RETURN_ON_ERROR(epd_wait_idle_after_refresh("refresh 0x12", &busy_seen), TAG, "direct refresh busy failed");
-        if (busy_seen) {
-            return ESP_OK;
-        }
-    }
-
-    ESP_LOGW(TAG, "refresh command did not trigger BUSY; panel may need another controller sequence");
+    ESP_RETURN_ON_ERROR(epd_send_command(0x12), TAG, "display refresh cmd failed");
+    ESP_RETURN_ON_ERROR(epd_send_data_byte(0x00), TAG, "display refresh data failed");
+    ESP_RETURN_ON_ERROR(epd_wait_ready_high("refresh display 0x12"), TAG, "refresh busy failed");
     return ESP_OK;
 }
 
 esp_err_t epd_2in13_init(void)
 {
+#if !VP_EPD_USE_SOFTWARE_SPI
     if (s_epd_spi == NULL) {
         spi_bus_config_t buscfg = {
             .mosi_io_num = VP_EPD_PIN_MOSI,
@@ -233,15 +220,27 @@ esp_err_t epd_2in13_init(void)
         ESP_RETURN_ON_ERROR(spi_bus_initialize(VP_EPD_HOST, &buscfg, SPI_DMA_CH_AUTO), TAG, "spi bus init failed");
         ESP_RETURN_ON_ERROR(spi_bus_add_device(VP_EPD_HOST, &devcfg, &s_epd_spi), TAG, "spi add device failed");
     }
+#endif
 
     gpio_config_t output_cfg = {
-        .pin_bit_mask = (1ULL << VP_EPD_PIN_DC) | (1ULL << VP_EPD_PIN_RST),
+        .pin_bit_mask = (1ULL << VP_EPD_PIN_DC) | (1ULL << VP_EPD_PIN_RST)
+#if VP_EPD_USE_SOFTWARE_SPI
+                        | (1ULL << VP_EPD_PIN_SCK) | (1ULL << VP_EPD_PIN_MOSI) | (1ULL << VP_EPD_PIN_CS)
+#endif
+                        ,
         .mode = GPIO_MODE_OUTPUT,
         .pull_up_en = GPIO_PULLUP_DISABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
         .intr_type = GPIO_INTR_DISABLE,
     };
     ESP_RETURN_ON_ERROR(gpio_config(&output_cfg), TAG, "gpio output config failed");
+
+#if VP_EPD_USE_SOFTWARE_SPI
+    gpio_set_level(VP_EPD_PIN_CS, 1);
+    gpio_set_level(VP_EPD_PIN_SCK, 1);
+    gpio_set_level(VP_EPD_PIN_MOSI, 1);
+    gpio_set_level(VP_EPD_PIN_DC, 1);
+#endif
 
     gpio_config_t input_cfg = {
         .pin_bit_mask = (1ULL << VP_EPD_PIN_BUSY),
@@ -252,36 +251,15 @@ esp_err_t epd_2in13_init(void)
     };
     ESP_RETURN_ON_ERROR(gpio_config(&input_cfg), TAG, "gpio input config failed");
 
-    /* 启动时打印一次关键引脚和驱动判定，便于现场核对接线。 */
-    ESP_LOGI(TAG, "EPD pins SCK=%d MOSI=%d CS=%d DC=%d RST=%d BUSY=%d busy_active=%d spi=%d Hz",
-             VP_EPD_PIN_SCK, VP_EPD_PIN_MOSI, VP_EPD_PIN_CS, VP_EPD_PIN_DC,
-             VP_EPD_PIN_RST, VP_EPD_PIN_BUSY, VP_EPD_BUSY_ACTIVE_LEVEL, VP_EPD_SPI_CLOCK_HZ);
+    ESP_LOGI(TAG,
+             "EPD panel=%s controller=%s 4SPI BWRY colors=4 buffer=%u bytes source=%d gate=%d pins SCK=%d MOSI=%d CS=%d DC=%d RST=%d BUSY=%d spi=%d Hz supply=%d mV",
+             VP_EPD_PANEL_MODEL_BWRY, VP_EPD_CONTROLLER_NAME, (unsigned)VP_EPD_BUFFER_SIZE,
+             VP_EPD_SOURCE_BITS, VP_EPD_GATE_BITS, VP_EPD_PIN_SCK, VP_EPD_PIN_MOSI, VP_EPD_PIN_CS,
+             VP_EPD_PIN_DC, VP_EPD_PIN_RST, VP_EPD_PIN_BUSY, VP_EPD_SPI_CLOCK_HZ,
+             VP_EPD_MODULE_SUPPLY_MV);
 
     ESP_RETURN_ON_ERROR(epd_reset(), TAG, "reset failed");
-
-    ESP_RETURN_ON_ERROR(epd_send_command(0x12), TAG, "sw reset cmd failed");
-    epd_delay_ms(10);
-    ESP_RETURN_ON_ERROR(epd_wait_idle("software reset"), TAG, "sw reset busy failed");
-
-    ESP_RETURN_ON_ERROR(epd_send_command(0x01), TAG, "driver output cmd failed");
-    ESP_RETURN_ON_ERROR(epd_send_data_byte((VP_EPD_HEIGHT - 1) & 0xff), TAG, "driver output h l failed");
-    ESP_RETURN_ON_ERROR(epd_send_data_byte((VP_EPD_HEIGHT - 1) >> 8), TAG, "driver output h h failed");
-    ESP_RETURN_ON_ERROR(epd_send_data_byte(0x00), TAG, "driver output gate failed");
-
-    ESP_RETURN_ON_ERROR(epd_send_command(0x11), TAG, "data entry cmd failed");
-    ESP_RETURN_ON_ERROR(epd_send_data_byte(0x03), TAG, "data entry data failed");
-
-    ESP_RETURN_ON_ERROR(epd_set_window(), TAG, "set window failed");
-
-    ESP_RETURN_ON_ERROR(epd_send_command(0x21), TAG, "display update mode cmd failed");
-    ESP_RETURN_ON_ERROR(epd_send_data_byte(0x00), TAG, "display update mode data 0 failed");
-    ESP_RETURN_ON_ERROR(epd_send_data_byte(0x80), TAG, "display update mode data 1 failed");
-
-    ESP_RETURN_ON_ERROR(epd_send_command(0x3C), TAG, "border cmd failed");
-    ESP_RETURN_ON_ERROR(epd_send_data_byte(0x05), TAG, "border data failed");
-
-    ESP_RETURN_ON_ERROR(epd_send_command(0x18), TAG, "temp sensor cmd failed");
-    ESP_RETURN_ON_ERROR(epd_send_data_byte(0x80), TAG, "temp sensor data failed");
+    ESP_RETURN_ON_ERROR(epd_vendor_init_sequence(), TAG, "vendor init failed");
 
     ESP_LOGI(TAG, "EPD initialized");
     return ESP_OK;
@@ -289,16 +267,19 @@ esp_err_t epd_2in13_init(void)
 
 esp_err_t epd_2in13_clear(void)
 {
-    ESP_RETURN_ON_ERROR(epd_set_window(), TAG, "set window for clear failed");
+    memset(s_4color_compat, epd_packed_color(VP_EPD_COLOR_WHITE), sizeof(s_4color_compat));
+    return epd_2in13_display_4color(s_4color_compat);
+}
 
-    ESP_RETURN_ON_ERROR(epd_send_command(0x24), TAG, "black ram cmd failed");
-    ESP_RETURN_ON_ERROR(epd_send_fill(0xFF, VP_EPD_BUFFER_SIZE), TAG, "black ram clear failed");
+esp_err_t epd_2in13_display_4color(const uint8_t *image)
+{
+    ESP_RETURN_ON_FALSE(image != NULL, ESP_ERR_INVALID_ARG, TAG, "4-color image buffer is null");
 
-    ESP_RETURN_ON_ERROR(epd_send_command(0x26), TAG, "red ram cmd failed");
-    ESP_RETURN_ON_ERROR(epd_send_fill(0xFF, VP_EPD_BUFFER_SIZE), TAG, "red ram clear failed");
-
-    ESP_RETURN_ON_ERROR(epd_refresh(), TAG, "clear refresh failed");
-    ESP_LOGI(TAG, "EPD cleared");
+    ESP_RETURN_ON_ERROR(epd_send_command(0x10), TAG, "4-color ram cmd failed");
+    ESP_LOGI(TAG, "write RAM 0x10 bytes=%u", (unsigned)VP_EPD_BUFFER_SIZE);
+    ESP_RETURN_ON_ERROR(epd_send_data(image, VP_EPD_BUFFER_SIZE), TAG, "4-color ram data failed");
+    ESP_RETURN_ON_ERROR(epd_refresh(), TAG, "4-color refresh failed");
+    ESP_LOGI(TAG, "EPD refreshed 4-color image");
     return ESP_OK;
 }
 
@@ -306,27 +287,29 @@ esp_err_t epd_2in13_display_bw(const uint8_t *black, const uint8_t *red)
 {
     ESP_RETURN_ON_FALSE(black != NULL, ESP_ERR_INVALID_ARG, TAG, "black buffer is null");
 
-    ESP_RETURN_ON_ERROR(epd_set_window(), TAG, "set window for display failed");
+    int old_stride = (VP_EPD_WIDTH + 7) / 8;
+    memset(s_4color_compat, epd_packed_color(VP_EPD_COLOR_WHITE), sizeof(s_4color_compat));
 
-    ESP_RETURN_ON_ERROR(epd_send_command(0x24), TAG, "black ram cmd failed");
-    ESP_RETURN_ON_ERROR(epd_send_data(black, VP_EPD_BUFFER_SIZE), TAG, "black ram write failed");
-
-    ESP_RETURN_ON_ERROR(epd_send_command(0x26), TAG, "red ram cmd failed");
-    if (red != NULL) {
-        ESP_RETURN_ON_ERROR(epd_send_data(red, VP_EPD_BUFFER_SIZE), TAG, "red ram write failed");
-    } else {
-        ESP_RETURN_ON_ERROR(epd_send_fill(0xFF, VP_EPD_BUFFER_SIZE), TAG, "red ram blank failed");
+    for (int y = 0; y < VP_EPD_HEIGHT; y++) {
+        for (int x = 0; x < VP_EPD_WIDTH; x++) {
+            uint8_t mask = (uint8_t)(0x80 >> (x % 8));
+            bool is_black = (black[y * old_stride + (x / 8)] & mask) == 0;
+            bool is_red = red != NULL && ((red[y * old_stride + (x / 8)] & mask) == 0);
+            uint8_t color = is_red ? VP_EPD_COLOR_RED : (is_black ? VP_EPD_COLOR_BLACK : VP_EPD_COLOR_WHITE);
+            epd_set_4color_pixel(s_4color_compat, x, y, color);
+        }
     }
 
-    ESP_RETURN_ON_ERROR(epd_refresh(), TAG, "display refresh failed");
-    ESP_LOGI(TAG, "EPD refreshed");
-    return ESP_OK;
+    return epd_2in13_display_4color(s_4color_compat);
 }
 
 esp_err_t epd_2in13_sleep(void)
 {
-    ESP_RETURN_ON_ERROR(epd_send_command(0x10), TAG, "deep sleep cmd failed");
-    ESP_RETURN_ON_ERROR(epd_send_data_byte(0x01), TAG, "deep sleep data failed");
+    ESP_RETURN_ON_ERROR(epd_send_command(0x02), TAG, "power off cmd failed");
+    ESP_RETURN_ON_ERROR(epd_send_data_byte(0x00), TAG, "power off data failed");
+    ESP_RETURN_ON_ERROR(epd_wait_ready_high("power off"), TAG, "power off busy failed");
+    ESP_RETURN_ON_ERROR(epd_send_command(0x07), TAG, "deep sleep cmd failed");
+    ESP_RETURN_ON_ERROR(epd_send_data_byte(0xA5), TAG, "deep sleep data failed");
     epd_delay_ms(100);
 
     ESP_LOGI(TAG, "EPD sleep");

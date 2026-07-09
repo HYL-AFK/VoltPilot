@@ -66,6 +66,14 @@ env/
 .ccls-cache/
 compile_commands.json
 
+# Local documentation/design exports and tool-generated review bundles
+.qoder/
+outputs/
+tmp/
+vendor_epd_review/
+vendor_epd_review_package.zip
+scripts/generate_*.py
+
 # Windows specific
 Thumbs.db
 ehthumbs.db
