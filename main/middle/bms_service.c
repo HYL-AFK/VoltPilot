@@ -6,6 +6,7 @@
 #include <string.h>
 
 #include "driver/uart.h"
+#include "driver/gpio.h"
 #include "esp_check.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
@@ -27,6 +28,60 @@ static const char *TAG = "bms_service";
 static bms_info_t s_bms_info;
 static uint8_t s_frame_buffer[BMS_FRAME_BUFFER_SIZE];
 static size_t s_frame_len;
+
+static bool bms_values_are_safe(const bms_info_t *info)
+{
+    if (info == NULL || info->cell_count == 0 || info->cell_count > BMS_MAX_CELL_COUNT ||
+        info->material == BMS_MATERIAL_UNKNOWN || info->pack_mv <= 0 ||
+        info->rsoc_percent > 100 || info->asoc_percent > 100 || info->soh_percent > 100) {
+        return false;
+    }
+
+    for (uint8_t i = 0; i < info->cell_count; i++) {
+        if (info->cell_mv[i] < 1500 || info->cell_mv[i] > 5000) {
+            return false;
+        }
+    }
+    return true;
+}
+
+#if VP_ENABLE_MOCK_DEVICES
+static void bms_mock_task(void *arg)
+{
+    (void)arg;
+    (void)watchdog_service_subscribe_current_task("vp_bms_mock");
+    memset(&s_bms_info, 0, sizeof(s_bms_info));
+    s_bms_info.material = BMS_MATERIAL_TERNARY_14S;
+    s_bms_info.cell_count = 14;
+    s_bms_info.pack_mv = 51800;
+    s_bms_info.current_ma = 0;
+    s_bms_info.rsoc_percent = 80;
+    s_bms_info.asoc_percent = 80;
+    s_bms_info.soh_percent = 100;
+    for (uint8_t i = 0; i < s_bms_info.cell_count; i++) {
+        s_bms_info.cell_mv[i] = 3700;
+    }
+
+    while (true) {
+        uint32_t now_ms = (uint32_t)pdTICKS_TO_MS(xTaskGetTickCount());
+        s_bms_info.online = VP_MOCK_BMS_FAULT_MODE == 0;
+        s_bms_info.parsed_valid = VP_MOCK_BMS_FAULT_MODE == 0;
+        s_bms_info.last_rx_ms = now_ms;
+        s_bms_info.last_parse_ms = now_ms;
+        s_bms_info.rx_frames++;
+        s_bms_info.parsed_frames++;
+        (void)diag_service_update_bms(&s_bms_info);
+        if (s_bms_info.online) {
+            (void)app_state_post_event(VP_APP_EVENT_BMS_RX, 0);
+        } else {
+            s_bms_info.timeout_count++;
+            (void)app_state_post_event(VP_APP_EVENT_BMS_TIMEOUT, s_bms_info.timeout_count);
+        }
+        watchdog_service_feed();
+        vTaskDelay(pdMS_TO_TICKS(VP_BMS_REQUEST_INTERVAL_MS));
+    }
+}
+#endif
 
 bool bms_service_get_info(bms_info_t *out_info)
 {
@@ -68,6 +123,19 @@ static esp_err_t bms_uart_init(void)
                                      UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE),
                         TAG, "配置 BMS UART 引脚失败");
 
+    if (VP_BMS_PIN_DE_RE != GPIO_NUM_NC) {
+        gpio_num_t de_re_pin = VP_BMS_PIN_DE_RE;
+        gpio_config_t de_re_cfg = {
+            .pin_bit_mask = 1ULL << (uint32_t)de_re_pin,
+            .mode = GPIO_MODE_OUTPUT,
+            .pull_up_en = GPIO_PULLUP_DISABLE,
+            .pull_down_en = GPIO_PULLDOWN_DISABLE,
+            .intr_type = GPIO_INTR_DISABLE,
+        };
+        ESP_RETURN_ON_ERROR(gpio_config(&de_re_cfg), TAG, "配置 RS485 DE/RE 失败");
+        ESP_RETURN_ON_ERROR(gpio_set_level(VP_BMS_PIN_DE_RE, 0), TAG, "关闭 RS485 DE/RE 失败");
+    }
+
     ESP_LOGI(TAG, "RS485 UART%d RX=%d TX=%d baud=%d request=%s interval=%dms",
              VP_BMS_UART_PORT, VP_BMS_PIN_RX, VP_BMS_PIN_TX, VP_BMS_UART_BAUD_RATE,
              BMS_PROTOCOL_REQUEST_TEXT, VP_BMS_REQUEST_INTERVAL_MS);
@@ -77,7 +145,14 @@ static esp_err_t bms_uart_init(void)
 static void bms_send_request(void)
 {
     const char request[] = BMS_PROTOCOL_REQUEST_TEXT;
+    if (VP_BMS_PIN_DE_RE != GPIO_NUM_NC) {
+        (void)gpio_set_level(VP_BMS_PIN_DE_RE, 1);
+    }
     int written = uart_write_bytes(VP_BMS_UART_PORT, request, strlen(request));
+    (void)uart_wait_tx_done(VP_BMS_UART_PORT, pdMS_TO_TICKS(100));
+    if (VP_BMS_PIN_DE_RE != GPIO_NUM_NC) {
+        (void)gpio_set_level(VP_BMS_PIN_DE_RE, 0);
+    }
 
     if (written == (int)strlen(request)) {
         ESP_LOGI(TAG, "BMS TX request=%s", request);
@@ -147,6 +222,9 @@ static esp_err_t parse_frame_candidate(size_t frame_len, bms_info_t *parsed)
     esp_err_t err = bms_protocol_parse(s_frame_buffer, frame_len, parsed);
 
     if (err == ESP_OK) {
+        if (!bms_values_are_safe(parsed)) {
+            return ESP_ERR_INVALID_RESPONSE;
+        }
         uint32_t now_ms = (uint32_t)pdTICKS_TO_MS(xTaskGetTickCount());
         parsed->online = true;
         parsed->parsed_valid = true;
@@ -306,6 +384,13 @@ esp_err_t bms_service_init(void)
 {
     memset(&s_bms_info, 0, sizeof(s_bms_info));
     s_frame_len = 0;
+#if VP_ENABLE_MOCK_DEVICES
+    BaseType_t ok = xTaskCreate(bms_mock_task, "vp_bms_mock", VP_TASK_STACK_LARGE, NULL,
+                                VP_TASK_PRIO_NORMAL, NULL);
+    ESP_RETURN_ON_FALSE(ok == pdPASS, ESP_ERR_NO_MEM, TAG, "创建 BMS mock 任务失败");
+    ESP_LOGW(TAG, "BMS mock 已启用，未打开 UART");
+    return ESP_OK;
+#else
     ESP_RETURN_ON_ERROR(bms_uart_init(), TAG, "BMS UART 初始化失败");
 
     BaseType_t ok = xTaskCreate(bms_service_task, "vp_bms", VP_TASK_STACK_LARGE, NULL,
@@ -313,4 +398,5 @@ esp_err_t bms_service_init(void)
     ESP_RETURN_ON_FALSE(ok == pdPASS, ESP_ERR_NO_MEM, TAG, "创建 BMS 任务失败");
     ESP_LOGI(TAG, "BMS 服务初始化完成，已启用出海版本特殊协议解析");
     return ESP_OK;
+#endif
 }

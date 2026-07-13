@@ -25,6 +25,8 @@ const char *fault_service_code_name(vp_fault_code_t code)
         return "OUTPUT_ERROR";
     case VP_FAULT_USER_REQUEST:
         return "USER_REQUEST";
+    case VP_FAULT_STC_VERSION:
+        return "STC_VERSION";
     default:
         return "UNKNOWN";
     }
@@ -46,6 +48,7 @@ void fault_service_raise(vp_fault_code_t code, const char *source)
 
     s_fault_code = code;
     s_fault_source = source != NULL ? source : "unknown";
+    (void)diag_service_capture_fault_outputs(board_output_get_state());
 
     /* 故障入口必须先关输出，再做日志、蜂鸣、显示等非安全动作。 */
     (void)board_output_all_off();

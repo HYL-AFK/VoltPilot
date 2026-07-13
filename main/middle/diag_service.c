@@ -187,9 +187,20 @@ esp_err_t diag_service_get_snapshot(vp_diag_registers_t *out_snapshot)
 
 esp_err_t diag_service_record_fault(vp_fault_code_t code, const char *source)
 {
+    if (code != VP_FAULT_NONE) {
+        s_regs.last_fault_ms = now_ms();
+    }
     s_regs.fault_code = (uint8_t)code;
     strlcpy(s_regs.fault_source, source != NULL ? source : "unknown", sizeof(s_regs.fault_source));
     return save_snapshot(true);
+}
+
+esp_err_t diag_service_capture_fault_outputs(board_output_state_t outputs)
+{
+    s_regs.fault_prev_en_24v = outputs.en_24v;
+    s_regs.fault_prev_en_36v = outputs.en_36v;
+    s_regs.fault_prev_en_48v = outputs.en_48v;
+    return ESP_OK;
 }
 
 esp_err_t diag_service_update_state(vp_app_state_t state,
@@ -236,6 +247,10 @@ esp_err_t diag_service_update_bms(const bms_info_t *info)
     s_regs.bms_pack_mv = info->pack_mv;
     s_regs.bms_current_ma = info->current_ma;
     s_regs.bms_rsoc_percent = info->rsoc_percent;
+    s_regs.bms_soh_percent = info->soh_percent;
+    s_regs.bms_protect_1 = info->protect_1;
+    s_regs.bms_protect_2 = info->protect_2;
+    s_regs.bms_protect_3 = info->protect_3;
     s_regs.bms_crc_error_count = info->crc_error_count;
     s_regs.bms_parse_error_count = info->parse_error_count;
     s_regs.bms_timeout_count = info->timeout_count;
@@ -257,6 +272,13 @@ esp_err_t diag_service_update_stc(const stc_info_t *info)
     s_regs.stc_gear_valid = info->gear_valid;
     s_regs.stc_raw_gear = info->raw_gear;
     s_regs.stc_protocol_version = info->protocol_version;
+    s_regs.stc_firmware_major = info->firmware_major;
+    s_regs.stc_firmware_minor = info->firmware_minor;
+    s_regs.stc_firmware_patch = info->firmware_patch;
+    s_regs.stc_hardware_major = info->hardware_major;
+    s_regs.stc_hardware_minor = info->hardware_minor;
+    s_regs.stc_io_inputs = info->io_inputs;
+    s_regs.stc_io_outputs = info->io_outputs;
     s_regs.stc_crc_error_count = info->crc_error_count;
     s_regs.stc_parse_error_count = info->parse_error_count;
     s_regs.stc_timeout_count = info->timeout_count;

@@ -28,6 +28,7 @@ static const char *TAG = "app_state";
 static QueueHandle_t s_event_queue;
 static vp_app_state_t s_state = VP_APP_STATE_BOOT;
 
+
 const char *app_state_name(vp_app_state_t state)
 {
     switch (state) {
@@ -101,11 +102,21 @@ static bool start_conditions_ok(void)
         return false;
     }
 
+    if (!stc_service_version_compatible(&stc)) {
+        ESP_LOGE(TAG, "STC version incompatible proto=%u fw=%u.%u.%u hw=%u.%u",
+                 stc.protocol_version, stc.firmware_major, stc.firmware_minor,
+                 stc.firmware_patch, stc.hardware_major, stc.hardware_minor);
+        fault_service_raise(VP_FAULT_STC_VERSION, "STC_VERSION");
+        return false;
+    }
+
+    /* STC8H 尚未接入时，使用 ESP32 直读三档开关作为挡位来源。 */
     if (!stc.gear_valid) {
         ESP_LOGW(TAG, "启动条件未满足：STC 在线但挡位无效 raw_gear=%u adc_key_raw=%u，禁止打开输出",
                  stc.raw_gear, stc.adc_key_raw);
         return false;
     }
+
 
     ESP_LOGI(TAG, "STC 有效：gear=%u adc_key_raw=%u debounce=%ums uptime=%" PRIu32
              "ms status=0x%04X",
@@ -116,8 +127,37 @@ static bool start_conditions_ok(void)
      * 因此本轮只完成启动条件诊断，不自动打开任何 EN，避免误上电。
      */
     ESP_LOGW(TAG, "启动条件已具备通信基础，但挡位到输出电压的映射未确认，本轮不打开 EN");
+#if VP_ENABLE_MOCK_DEVICES
+    ESP_LOGW(TAG, "mock 模式：使用虚拟输出继续验证状态机，真实 EN 保持关闭");
+    return VP_ENABLE_VIRTUAL_OUTPUT != 0;
+#endif
     return false;
 }
+
+#if 0
+static bool stc_interlock_is_safe(void)
+{
+    stc_info_t stc = {0};
+    if (VP_STC_INTERLOCK_INPUT_MASK == 0 || !stc_service_get_info(&stc)) {
+        ESP_LOGE(TAG, "STC 互锁未配置或 STC 不在线，拒绝启动");
+        return false;
+    }
+    if (!stc.io_status_valid) {
+        ESP_LOGW(TAG, "STC 尚未提供有效 IO 状态，拒绝启动");
+        return false;
+    }
+
+    uint16_t masked = stc.io_inputs & VP_STC_INTERLOCK_INPUT_MASK;
+    uint16_t expected = VP_STC_INTERLOCK_ACTIVE_LEVEL ? VP_STC_INTERLOCK_INPUT_MASK : 0;
+    bool safe = masked == expected;
+    if (!safe) {
+        ESP_LOGW(TAG, "STC 互锁不安全 inputs=0x%04X mask=0x%04X expected=0x%04X",
+                 stc.io_inputs, VP_STC_INTERLOCK_INPUT_MASK, expected);
+    }
+    return safe;
+}
+
+#endif
 
 static void handle_button_single(void)
 {
@@ -147,6 +187,14 @@ static void handle_button_double(void)
 
     ESP_ERROR_CHECK_WITHOUT_ABORT(board_output_all_off());
     vTaskDelay(pdMS_TO_TICKS(VP_OUTPUT_INTERLOCK_DELAY_MS));
+#if VP_ENABLE_MOCK_DEVICES && VP_ENABLE_VIRTUAL_OUTPUT
+    stc_info_t stc = {0};
+    (void)stc_service_get_info(&stc);
+    (void)board_virtual_output_request(stc.raw_gear);
+    (void)board_buzzer_beep(2400, 180);
+    change_state(VP_APP_STATE_RUNNING);
+    return;
+#endif
     ESP_LOGW(TAG, "目标输出映射尚未确认，本轮不打开 EN");
 }
 
@@ -155,8 +203,10 @@ static void handle_button_long(void)
     ESP_LOGW(TAG, "长按：执行安全关断");
     (void)board_output_all_off();
     (void)board_buzzer_beep(1000, 150);
+    if (s_state == VP_APP_STATE_FAULT) {
+        fault_service_clear();
+    }
     change_state(VP_APP_STATE_STANDBY);
-    (void)watchdog_service_subscribe_current_task("vp_state");
 }
 
 static void handle_timeout_event(vp_app_event_id_t id)
@@ -174,6 +224,9 @@ static void app_state_task(void *arg)
 {
     (void)arg;
     TickType_t last_health = xTaskGetTickCount();
+    TickType_t boot_tick = last_health;
+    bool mock_fault_triggered = false;
+    (void)watchdog_service_subscribe_current_task("vp_state");
 
     change_state(VP_APP_STATE_STANDBY);
 
@@ -191,8 +244,17 @@ static void app_state_task(void *arg)
                 handle_button_long();
                 break;
             case VP_APP_EVENT_BMS_RX:
-            case VP_APP_EVENT_STC_RX:
             case VP_APP_EVENT_ADC_UPDATE:
+                break;
+            case VP_APP_EVENT_STC_RX:
+                {
+                    stc_info_t stc = {0};
+                    (void)stc_service_get_info(&stc);
+                    if (!stc_service_version_compatible(&stc)) {
+                        fault_service_raise(VP_FAULT_STC_VERSION, "STC_VERSION");
+                        change_state(VP_APP_STATE_FAULT);
+                    }
+                }
                 break;
             case VP_APP_EVENT_BMS_TIMEOUT:
             case VP_APP_EVENT_STC_TIMEOUT:
@@ -207,6 +269,15 @@ static void app_state_task(void *arg)
                 break;
             }
         }
+
+#if VP_ENABLE_MOCK_DEVICES && VP_MOCK_FORCE_FAULT
+        if (!mock_fault_triggered &&
+            pdTICKS_TO_MS(xTaskGetTickCount() - boot_tick) >= VP_MOCK_FORCE_FAULT_DELAY_MS) {
+            mock_fault_triggered = true;
+            fault_service_raise(VP_FAULT_USER_REQUEST, "MOCK_FORCE_FAULT");
+            change_state(VP_APP_STATE_FAULT);
+        }
+#endif
 
         if (pdTICKS_TO_MS(xTaskGetTickCount() - last_health) >= 5000) {
             board_output_state_t out = board_output_get_state();

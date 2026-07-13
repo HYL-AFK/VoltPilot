@@ -12,6 +12,7 @@ typedef enum {
     VP_FAULT_ADC_ERROR,
     VP_FAULT_OUTPUT_ERROR,
     VP_FAULT_USER_REQUEST,
+    VP_FAULT_STC_VERSION,
 } vp_fault_code_t;
 
 esp_err_t fault_service_init(void);

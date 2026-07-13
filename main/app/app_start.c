@@ -6,6 +6,7 @@
 #include "freertos/task.h"
 
 #include "adc_service.h"
+#include "ai_rs485_service.h"
 #include "app_state_service.h"
 #include "bms_service.h"
 #include "board_service.h"
@@ -27,27 +28,34 @@ void app_main_start(void)
     esp_err_t err = board_service_init();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "board service init failed: %s", esp_err_to_name(err));
+        return;
     }
 
     err = fault_service_init();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "fault service init failed: %s", esp_err_to_name(err));
+        return;
     }
 
     err = diag_service_init();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "diag service init failed: %s", esp_err_to_name(err));
+        return;
     }
 
     err = watchdog_service_init();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "watchdog service init failed: %s", esp_err_to_name(err));
+        (void)board_output_all_off();
+        return;
     }
 
 #if VP_ENABLE_STATE_SERVICE
     err = app_state_service_init();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "state service init failed: %s", esp_err_to_name(err));
+        (void)board_output_all_off();
+        return;
     }
 #endif
 
@@ -55,6 +63,8 @@ void app_main_start(void)
     err = adc_service_init();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "adc service init failed: %s", esp_err_to_name(err));
+        (void)board_output_all_off();
+        return;
     }
 #endif
 
@@ -62,6 +72,8 @@ void app_main_start(void)
     err = bms_service_init();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "bms service init failed: %s", esp_err_to_name(err));
+        (void)board_output_all_off();
+        return;
     }
 #endif
 
@@ -69,6 +81,8 @@ void app_main_start(void)
     err = stc_service_init();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "stc service init failed: %s", esp_err_to_name(err));
+        (void)board_output_all_off();
+        return;
     }
 #endif
 
@@ -78,6 +92,11 @@ void app_main_start(void)
         ESP_LOGE(TAG, "ui service init failed: %s", esp_err_to_name(err));
     }
 #endif
+
+    err = ai_rs485_service_init();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "AI RS485 init failed: %s", esp_err_to_name(err));
+    }
 
 #if VP_ENABLE_DISPLAY
     err = display_service_init();

@@ -17,6 +17,12 @@ static bool s_board_inited;
 
 static esp_err_t board_set_output(gpio_num_t pin, bool *state, bool enable)
 {
+    if (enable && ((state != &s_output_state.en_24v && s_output_state.en_24v) ||
+                   (state != &s_output_state.en_36v && s_output_state.en_36v) ||
+                   (state != &s_output_state.en_48v && s_output_state.en_48v))) {
+        ESP_LOGE(TAG, "拒绝同时打开多路输出");
+        return ESP_ERR_INVALID_STATE;
+    }
     *state = enable;
     esp_err_t err = gpio_set_level(pin, enable ? VP_OUTPUT_ENABLE_ACTIVE_LEVEL : VP_OUTPUT_ENABLE_INACTIVE_LEVEL);
     if (err == ESP_OK) {
@@ -54,9 +60,19 @@ board_output_state_t board_output_get_state(void)
     return s_output_state;
 }
 
-esp_err_t board_sys_led_set(bool on)
+esp_err_t board_virtual_output_request(uint8_t gear)
 {
-    return gpio_set_level(VP_PIN_SYS_LED, on ? VP_SYS_LED_ACTIVE_LEVEL : !VP_SYS_LED_ACTIVE_LEVEL);
+    ESP_LOGI(TAG, "虚拟输出请求 gear=%u；真实 EN 保持关闭", gear);
+    return ESP_OK;
+}
+
+esp_err_t board_status_led_set(board_status_led_t state)
+{
+    int green_level = state == BOARD_STATUS_LED_GREEN ? VP_STATUS_LED_ACTIVE_LEVEL : !VP_STATUS_LED_ACTIVE_LEVEL;
+    int red_level = state == BOARD_STATUS_LED_RED ? VP_STATUS_LED_ACTIVE_LEVEL : !VP_STATUS_LED_ACTIVE_LEVEL;
+
+    ESP_RETURN_ON_ERROR(gpio_set_level(VP_PIN_LED_GREEN, green_level), TAG, "set green status LED failed");
+    return gpio_set_level(VP_PIN_LED_RED, red_level);
 }
 
 esp_err_t board_buzzer_beep(uint32_t freq_hz, uint32_t duration_ms)
@@ -81,7 +97,8 @@ static esp_err_t board_gpio_init(void)
         .pin_bit_mask = (1ULL << VP_OUT_PIN_EN_24V) |
                         (1ULL << VP_OUT_PIN_EN_36V) |
                         (1ULL << VP_OUT_PIN_EN_48V) |
-                        (1ULL << VP_PIN_SYS_LED),
+                        (1ULL << VP_PIN_LED_GREEN) |
+                        (1ULL << VP_PIN_LED_RED),
         .mode = GPIO_MODE_OUTPUT,
         .pull_up_en = GPIO_PULLUP_DISABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
@@ -90,7 +107,7 @@ static esp_err_t board_gpio_init(void)
     ESP_RETURN_ON_ERROR(gpio_config(&output_cfg), TAG, "配置输出 GPIO 失败");
 
     ESP_RETURN_ON_ERROR(board_output_all_off(), TAG, "默认关闭输出失败");
-    ESP_RETURN_ON_ERROR(board_sys_led_set(false), TAG, "关闭系统灯失败");
+    ESP_RETURN_ON_ERROR(board_status_led_set(BOARD_STATUS_LED_OFF), TAG, "关闭状态灯失败");
 
     gpio_config_t input_cfg = {
         .pin_bit_mask = (1ULL << VP_PIN_SCREEN_BUTTON),
@@ -130,12 +147,12 @@ esp_err_t board_service_init(void)
 {
     ESP_LOGI(TAG,
              "板级引脚: ADC24=%d ADC5=%d ADC36=%d ADC48=%d RS485_RX=%d RS485_TX=%d "
-             "EN48=%d EN36=%d EN24=%d STC_TX=%d STC_RX=%d BUTTON=%d BUZZER=%d SYS_LED=%d",
+             "EN48=%d EN36=%d EN24=%d STC_TX=%d STC_RX=%d BUTTON=%d BUZZER=%d LED_GREEN=%d LED_RED=%d",
              VP_ADC_PIN_24V, VP_ADC_PIN_5V, VP_ADC_PIN_36V, VP_ADC_PIN_48V,
              VP_BMS_PIN_RX, VP_BMS_PIN_TX,
              VP_OUT_PIN_EN_48V, VP_OUT_PIN_EN_36V, VP_OUT_PIN_EN_24V,
              VP_STC_PIN_TX, VP_STC_PIN_RX,
-             VP_PIN_SCREEN_BUTTON, VP_PIN_BUZZER_PWM, VP_PIN_SYS_LED);
+             VP_PIN_SCREEN_BUTTON, VP_PIN_BUZZER_PWM, VP_PIN_LED_GREEN, VP_PIN_LED_RED);
 
     ESP_RETURN_ON_ERROR(board_gpio_init(), TAG, "GPIO 初始化失败");
     ESP_RETURN_ON_ERROR(board_buzzer_init(), TAG, "蜂鸣器初始化失败");

@@ -15,7 +15,7 @@
 
 #define VP_DIAG_FAULT_SOURCE_LEN 16
 #define VP_DIAG_TASK_NAME_LEN 12
-#define VP_DIAG_WDT_TASK_COUNT 6
+#define VP_DIAG_WDT_TASK_COUNT 8
 
 typedef struct {
     char name[VP_DIAG_TASK_NAME_LEN];
@@ -35,6 +35,10 @@ typedef struct {
     bool en_24v;
     bool en_36v;
     bool en_48v;
+    uint32_t last_fault_ms;
+    bool fault_prev_en_24v;
+    bool fault_prev_en_36v;
+    bool fault_prev_en_48v;
 
     vp_adc_channel_value_t adc[VP_ADC_INPUT_COUNT];
     uint32_t adc_update_ms;
@@ -46,6 +50,10 @@ typedef struct {
     int32_t bms_pack_mv;
     int32_t bms_current_ma;
     uint8_t bms_rsoc_percent;
+    uint16_t bms_soh_percent;
+    uint8_t bms_protect_1;
+    uint8_t bms_protect_2;
+    uint8_t bms_protect_3;
     uint32_t bms_crc_error_count;
     uint32_t bms_parse_error_count;
     uint32_t bms_timeout_count;
@@ -57,6 +65,13 @@ typedef struct {
     bool stc_gear_valid;
     uint8_t stc_raw_gear;
     uint8_t stc_protocol_version;
+    uint8_t stc_firmware_major;
+    uint8_t stc_firmware_minor;
+    uint8_t stc_firmware_patch;
+    uint8_t stc_hardware_major;
+    uint8_t stc_hardware_minor;
+    uint16_t stc_io_inputs;
+    uint16_t stc_io_outputs;
     uint32_t stc_crc_error_count;
     uint32_t stc_parse_error_count;
     uint32_t stc_timeout_count;
@@ -68,6 +83,7 @@ typedef struct {
 esp_err_t diag_service_init(void);
 esp_err_t diag_service_get_snapshot(vp_diag_registers_t *out_snapshot);
 esp_err_t diag_service_record_fault(vp_fault_code_t code, const char *source);
+esp_err_t diag_service_capture_fault_outputs(board_output_state_t outputs);
 esp_err_t diag_service_update_state(vp_app_state_t state,
                                     vp_fault_code_t fault,
                                     const char *fault_source,
@@ -79,4 +95,3 @@ esp_err_t diag_service_update_stc(const stc_info_t *info);
 esp_err_t diag_service_update_watchdog_task(const char *task_name, uint32_t feed_ms);
 
 #endif
-

@@ -19,23 +19,31 @@ static const char *TAG = "ui_service";
 static void led_task(void *arg)
 {
     (void)arg;
-    bool on = false;
+    bool blink_on = false;
     (void)watchdog_service_subscribe_current_task("vp_led");
 
     while (true) {
         vp_app_state_t state = app_state_service_get_state();
-        uint32_t period_ms = 500;
+        board_status_led_t led_state = BOARD_STATUS_LED_OFF;
+        uint32_t period_ms = 250;
 
         if (fault_service_has_fault() || state == VP_APP_STATE_FAULT) {
-            period_ms = 120;
+            led_state = BOARD_STATUS_LED_RED;
+            blink_on = false;
+            period_ms = 500;
         } else if (state == VP_APP_STATE_PREPARE) {
-            period_ms = 250;
+            blink_on = !blink_on;
+            led_state = blink_on ? BOARD_STATUS_LED_GREEN : BOARD_STATUS_LED_OFF;
         } else if (state == VP_APP_STATE_RUNNING) {
-            period_ms = 1000;
+            led_state = BOARD_STATUS_LED_GREEN;
+            blink_on = false;
+            period_ms = 500;
+        } else {
+            blink_on = false;
+            period_ms = 500;
         }
 
-        on = !on;
-        (void)board_sys_led_set(on);
+        (void)board_status_led_set(led_state);
         watchdog_service_feed();
         vTaskDelay(pdMS_TO_TICKS(period_ms));
     }
@@ -81,10 +89,15 @@ static void button_task(void *arg)
             } else {
                 ESP_LOGI(TAG, "按键释放");
                 if (!long_reported) {
+                    if (click_count == 1 &&
+                        pdTICKS_TO_MS(now - last_release) > VP_BUTTON_DOUBLE_CLICK_MS) {
+                        click_count = 0;
+                    }
+                    TickType_t previous_release = last_release;
                     click_count++;
                     last_release = now;
-                    if (click_count >= 2 &&
-                        pdTICKS_TO_MS(now - last_release) <= VP_BUTTON_DOUBLE_CLICK_MS) {
+                    if (click_count >= 2 && previous_release != 0 &&
+                        pdTICKS_TO_MS(now - previous_release) <= VP_BUTTON_DOUBLE_CLICK_MS) {
                         click_count = 0;
                         ESP_LOGI(TAG, "按键双击");
                         post_button_event(VP_APP_EVENT_BUTTON_DOUBLE);
@@ -115,7 +128,7 @@ static void button_task(void *arg)
 
 esp_err_t ui_service_init(void)
 {
-    BaseType_t ok = xTaskCreate(led_task, "vp_led", VP_TASK_STACK_SMALL, NULL,
+    BaseType_t ok = xTaskCreate(led_task, "vp_led", VP_TASK_STACK_NORMAL, NULL,
                                 VP_TASK_PRIO_LOW, NULL);
     ESP_RETURN_ON_FALSE(ok == pdPASS, ESP_ERR_NO_MEM, TAG, "创建 LED 任务失败");
 

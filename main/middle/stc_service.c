@@ -29,6 +29,47 @@ static uint8_t s_stream_buffer[STC_STREAM_BUFFER_SIZE];
 static size_t s_stream_len;
 static uint8_t s_next_seq;
 
+bool stc_service_version_compatible(const stc_info_t *info)
+{
+    return info != NULL &&
+           info->protocol_version == VP_STC_REQUIRED_PROTOCOL_VERSION &&
+           info->firmware_major >= VP_STC_REQUIRED_FIRMWARE_MAJOR &&
+           info->hardware_major >= VP_STC_REQUIRED_HARDWARE_MAJOR;
+}
+
+#if VP_ENABLE_MOCK_DEVICES
+static void stc_mock_task(void *arg)
+{
+    (void)arg;
+    (void)watchdog_service_subscribe_current_task("vp_stc_mock");
+    memset(&s_stc_info, 0, sizeof(s_stc_info));
+    s_stc_info.raw_gear = 1;
+    s_stc_info.gear_valid = true;
+    s_stc_info.adc_key_raw = 1000;
+    s_stc_info.debounce_ms = 50;
+    s_stc_info.protocol_version = 1;
+    s_stc_info.firmware_major = 1;
+    s_stc_info.hardware_major = 1;
+
+    while (true) {
+        s_stc_info.online = VP_MOCK_STC_FAULT_MODE == 0;
+        s_stc_info.gear_valid = VP_MOCK_STC_FAULT_MODE == 0;
+        s_stc_info.uptime_ms = (uint32_t)pdTICKS_TO_MS(xTaskGetTickCount());
+        s_stc_info.rx_frames++;
+        s_stc_info.parsed_frames++;
+        (void)diag_service_update_stc(&s_stc_info);
+        if (s_stc_info.online) {
+            (void)app_state_post_event(VP_APP_EVENT_STC_RX, STC_FUNC_READ_GEAR);
+        } else {
+            s_stc_info.timeout_count++;
+            (void)app_state_post_event(VP_APP_EVENT_STC_TIMEOUT, s_stc_info.timeout_count);
+        }
+        watchdog_service_feed();
+        vTaskDelay(pdMS_TO_TICKS(VP_STC_READ_GEAR_INTERVAL_MS));
+    }
+}
+#endif
+
 bool stc_service_get_info(stc_info_t *out_info)
 {
     if (out_info == NULL) {
@@ -148,6 +189,7 @@ static void stc_send_request(uint8_t func)
 static void stc_poll_requests(TickType_t now,
                               TickType_t *last_heartbeat,
                               TickType_t *last_gear,
+                              TickType_t *last_io,
                               TickType_t *last_version)
 {
     if (*last_heartbeat == 0 ||
@@ -161,6 +203,13 @@ static void stc_poll_requests(TickType_t now,
         pdTICKS_TO_MS(now - *last_gear) >= VP_STC_READ_GEAR_INTERVAL_MS) {
         stc_send_request(STC_FUNC_READ_GEAR);
         *last_gear = now;
+        return;
+    }
+
+    if (*last_io == 0 ||
+        pdTICKS_TO_MS(now - *last_io) >= VP_STC_READ_IO_INTERVAL_MS) {
+        stc_send_request(STC_FUNC_READ_IO_STATUS);
+        *last_io = now;
         return;
     }
 
@@ -252,6 +301,7 @@ static bool handle_io_status_frame(const stc_protocol_frame_t *frame)
 
     s_stc_info.io_inputs = read_be16(frame->payload);
     s_stc_info.io_outputs = read_be16(frame->payload + 2);
+    s_stc_info.io_status_valid = true;
     s_stc_info.parsed_frames++;
     post_parsed_frame(frame->func);
     ESP_LOGI(TAG, "STC RX IO_STATUS seq=%u inputs=0x%04X outputs=0x%04X",
@@ -373,12 +423,13 @@ static void stc_service_task(void *arg)
     TickType_t last_valid_tick = xTaskGetTickCount();
     TickType_t last_heartbeat = 0;
     TickType_t last_gear = 0;
+    TickType_t last_io = 0;
     TickType_t last_version = 0;
     (void)watchdog_service_subscribe_current_task("vp_stc");
 
     while (true) {
         TickType_t now = xTaskGetTickCount();
-        stc_poll_requests(now, &last_heartbeat, &last_gear, &last_version);
+        stc_poll_requests(now, &last_heartbeat, &last_gear, &last_io, &last_version);
 
         int len = uart_read_bytes(VP_STC_UART_PORT, data, sizeof(data), pdMS_TO_TICKS(100));
         if (len > 0) {
@@ -395,6 +446,7 @@ static void stc_service_task(void *arg)
             last_valid_tick = xTaskGetTickCount();
             s_stc_info.online = false;
             s_stc_info.gear_valid = false;
+            s_stc_info.io_status_valid = false;
             s_stc_info.timeout_count++;
             s_stream_len = 0;
             ESP_LOGW(TAG, "STC_TIMEOUT count=%" PRIu32, s_stc_info.timeout_count);
@@ -410,6 +462,13 @@ esp_err_t stc_service_init(void)
     memset(&s_stc_info, 0, sizeof(s_stc_info));
     s_stream_len = 0;
     s_next_seq = 0;
+#if VP_ENABLE_MOCK_DEVICES
+    BaseType_t ok = xTaskCreate(stc_mock_task, "vp_stc_mock", VP_TASK_STACK_LARGE, NULL,
+                                VP_TASK_PRIO_NORMAL, NULL);
+    ESP_RETURN_ON_FALSE(ok == pdPASS, ESP_ERR_NO_MEM, TAG, "创建 STC mock 任务失败");
+    ESP_LOGW(TAG, "STC mock 已启用，未打开 UART");
+    return ESP_OK;
+#else
     ESP_RETURN_ON_ERROR(stc_uart_init(), TAG, "STC UART 初始化失败");
 
     BaseType_t ok = xTaskCreate(stc_service_task, "vp_stc", VP_TASK_STACK_LARGE, NULL,
@@ -417,4 +476,5 @@ esp_err_t stc_service_init(void)
     ESP_RETURN_ON_FALSE(ok == pdPASS, ESP_ERR_NO_MEM, TAG, "创建 STC 任务失败");
     ESP_LOGI(TAG, "STC 服务初始化完成，已启用自定义 RTU 帧协议");
     return ESP_OK;
+#endif
 }

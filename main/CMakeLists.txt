@@ -3,6 +3,7 @@ idf_component_register(
         "main.c"
         "app/app_start.c"
         "middle/adc_service.c"
+        "middle/ai_rs485_service.c"
         "middle/app_state_service.c"
         "middle/bms_protocol.c"
         "middle/bms_service.c"
