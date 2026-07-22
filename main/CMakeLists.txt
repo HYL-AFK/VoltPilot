@@ -10,6 +10,9 @@ idf_component_register(
         "middle/board_service.c"
         "middle/diag_service.c"
         "middle/display_service.c"
+        "middle/epd_ui_font.c"
+        "middle/epd_ui_renderer.c"
+        "middle/epd_ui_trigger.c"
         "middle/fault_service.c"
         "middle/stc_protocol.c"
         "middle/stc_service.c"
@@ -26,7 +29,6 @@ idf_component_register(
         esp_driver_gpio
         esp_driver_spi
         esp_driver_uart
-        esp_driver_i2c
         esp_driver_ledc
         esp_adc
         esp_app_format

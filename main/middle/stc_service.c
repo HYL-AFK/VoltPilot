@@ -24,6 +24,9 @@
 
 static const char *TAG = "stc_service";
 
+/* 三挡开关联调阶段：只显示 READ_GEAR 和挡位解析结果。 */
+#define VP_STC_GEAR_LOG_ONLY 1
+
 static stc_info_t s_stc_info;
 static uint8_t s_stream_buffer[STC_STREAM_BUFFER_SIZE];
 static size_t s_stream_len;
@@ -94,6 +97,12 @@ static uint32_t read_be32(const uint8_t *data)
 
 static void log_hex_frame(const char *prefix, const uint8_t *data, int len)
 {
+#if VP_STC_GEAR_LOG_ONLY
+    (void)prefix;
+    (void)data;
+    (void)len;
+    return;
+#else
     char line[3 * 48 + 1];
     int offset = 0;
     int show_len = len > 48 ? 48 : len;
@@ -103,6 +112,7 @@ static void log_hex_frame(const char *prefix, const uint8_t *data, int len)
     }
     line[sizeof(line) - 1] = '\0';
     ESP_LOGI(TAG, "%s len=%d data=%s%s", prefix, len, line, len > 48 ? "..." : "");
+#endif
 }
 
 static bool stc_addr_can_start_frame(uint8_t addr)
@@ -179,7 +189,13 @@ static void stc_send_request(uint8_t func)
 
     int written = uart_write_bytes(VP_STC_UART_PORT, frame, frame_len);
     if (written == (int)frame_len) {
+#if !VP_STC_GEAR_LOG_ONLY
         ESP_LOGI(TAG, "STC TX %s seq=%u len=%u", stc_protocol_func_name(func), seq, (unsigned)frame_len);
+#else
+        if (func == STC_FUNC_READ_GEAR) {
+            ESP_LOGI(TAG, "STC TX READ_GEAR seq=%u len=%u", seq, (unsigned)frame_len);
+        }
+#endif
     } else {
         ESP_LOGW(TAG, "STC TX failed func=%s seq=%u written=%d/%u",
                  stc_protocol_func_name(func), seq, written, (unsigned)frame_len);
@@ -269,9 +285,11 @@ static bool handle_heartbeat_frame(const stc_protocol_frame_t *frame)
     s_stc_info.protocol_version = frame->payload[6];
     s_stc_info.parsed_frames++;
     post_parsed_frame(frame->func);
+#if !VP_STC_GEAR_LOG_ONLY
     ESP_LOGI(TAG, "STC RX HEARTBEAT seq=%u uptime=%" PRIu32 "ms status=0x%04X proto=%u",
              frame->seq, s_stc_info.uptime_ms, s_stc_info.status_flags,
              s_stc_info.protocol_version);
+#endif
     return true;
 }
 
@@ -304,8 +322,10 @@ static bool handle_io_status_frame(const stc_protocol_frame_t *frame)
     s_stc_info.io_status_valid = true;
     s_stc_info.parsed_frames++;
     post_parsed_frame(frame->func);
+#if !VP_STC_GEAR_LOG_ONLY
     ESP_LOGI(TAG, "STC RX IO_STATUS seq=%u inputs=0x%04X outputs=0x%04X",
              frame->seq, s_stc_info.io_inputs, s_stc_info.io_outputs);
+#endif
     return true;
 }
 
@@ -323,10 +343,12 @@ static bool handle_version_frame(const stc_protocol_frame_t *frame)
     s_stc_info.hardware_minor = frame->payload[5];
     s_stc_info.parsed_frames++;
     post_parsed_frame(frame->func);
+#if !VP_STC_GEAR_LOG_ONLY
     ESP_LOGI(TAG, "STC RX VERSION seq=%u proto=%u fw=%u.%u.%u hw=%u.%u",
              frame->seq, s_stc_info.protocol_version,
              s_stc_info.firmware_major, s_stc_info.firmware_minor, s_stc_info.firmware_patch,
              s_stc_info.hardware_major, s_stc_info.hardware_minor);
+#endif
     return true;
 }
 

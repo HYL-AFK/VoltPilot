@@ -13,13 +13,15 @@
 
 /* 功能开关：启用 2.13 寸黑白红三色墨水屏启动测试。 */
 #define VP_ENABLE_DISPLAY 1
+/* 客户界面使用真实 BMS/STC/状态机数据；需要视觉联调时可临时改为 1。 */
+#define VP_EPD_UI_DEMO_DATA 0
 #define VP_ENABLE_ADC_SERVICE 1
 #define VP_ENABLE_BMS_SERVICE 1
 #define VP_ENABLE_STC_SERVICE 1
 #define VP_ENABLE_UI_SERVICE 1
 #define VP_ENABLE_STATE_SERVICE 1
-/* Single-board bring-up mode. Set to 0 before connecting real BMS/STC hardware. */
-#define VP_ENABLE_MOCK_DEVICES 0 /* 已连接真实 STC，关闭模拟设备 */
+/* 单板联调时可模拟 BMS/STC；连接真实设备后保持关闭。 */
+#define VP_ENABLE_MOCK_DEVICES 0
 #define VP_ENABLE_VIRTUAL_OUTPUT 1
 #define VP_MOCK_BMS_FAULT_MODE 0
 #define VP_MOCK_STC_FAULT_MODE 0
@@ -37,8 +39,8 @@
 #define VP_EPD_SPI_CLOCK_HZ (400 * 1000)
 #define VP_EPD_USE_SOFTWARE_SPI 1
 #define VP_EPD_SOFTWARE_SPI_DELAY_US 5
-/* JD79661AA: BUSY=0 while busy, BUSY=1 when idle. */
-#define VP_EPD_BUSY_ACTIVE_LEVEL 0
+/* SSD1680: BUSY=1 while busy, BUSY=0 when idle. */
+#define VP_EPD_BUSY_ACTIVE_LEVEL 1
 #define VP_EPD_BUSY_START_TIMEOUT_MS 1000
 #define VP_EPD_BUSY_TIMEOUT_MS 30000
 #define VP_EPD_BOOT_FULL_BLACK_TEST 0
@@ -59,7 +61,7 @@
 #define VP_STC_REQUIRED_HARDWARE_MAJOR 1
 /* Configure from the STC wiring. Zero is deliberately fail-safe: startup is blocked. */
 
-/* AI 模拟量 RS485 联调模块：当前 STC 使用 Mock，UART1 可供 AI 模块使用。 */
+/* AI 模拟量 RS485 模块使用独立的 UART1。 */
 #define VP_AI_RS485_UART_PORT UART_NUM_1
 #define VP_AI_RS485_BAUD_RATE 9600
 #define VP_AI_RS485_DEVICE_ADDR 1
@@ -79,6 +81,15 @@
 #define VP_BMS_PIN_DE_RE GPIO_NUM_NC
 #define VP_BMS_RX_TIMEOUT_MS 10000
 #define VP_BMS_REQUEST_INTERVAL_MS 1000
+/* 充电页只在 BMS 充电 MOS 开启且电流达到该阈值时显示。 */
+#define VP_BMS_CHARGING_CURRENT_MIN_MA 100
+/* 当前按常见约定：正电流表示充电。接入充电器后可按实测日志改为 0。 */
+#define VP_BMS_CHARGE_CURRENT_IS_POSITIVE 1
+/* 充电页面状态机：进入防抖、退出防抖和 SOC 滞回阈值。 */
+#define VP_UI_CHARGING_ENTER_STABLE_MS 3000
+#define VP_UI_CHARGING_EXIT_STABLE_MS 3000
+#define VP_UI_CHARGING_ENTER_SOC_PERCENT 20
+#define VP_UI_CHARGING_EXIT_SOC_PERCENT 22
 
 /* AI analog module RS485 pins; independent from STC TTL UART. */
 
@@ -105,13 +116,6 @@
 #define VP_OUTPUT_ENABLE_ACTIVE_LEVEL 1
 #define VP_OUTPUT_ENABLE_INACTIVE_LEVEL 0
 #define VP_OUTPUT_INTERLOCK_DELAY_MS 200
-
-/* 预留 EEPROM/FRAM I2C 总线，用于后续 A/B 记录与 CRC 恢复。 */
-#define VP_I2C_PORT 0
-#define VP_I2C_PIN_SCL GPIO_NUM_35
-#define VP_I2C_PIN_SDA GPIO_NUM_36
-#define VP_I2C_CLOCK_HZ 400000
-#define VP_STATE_SAVE_STABLE_MS 5000
 
 /* 人机接口：按钮、蜂鸣器、系统灯。 */
 #define VP_PIN_SCREEN_BUTTON GPIO_NUM_39

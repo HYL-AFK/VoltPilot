@@ -94,15 +94,16 @@ bool bms_service_get_info(bms_info_t *out_info)
 
 static void log_hex_frame(const char *prefix, const uint8_t *data, int len)
 {
-    char line[3 * 48 + 1];
+    /* 当前已确认的 BMS 完整帧为 128 或 130 字节，联调时完整打印。 */
+    char line[3 * BMS_PROTOCOL_MAX_FRAME_LEN + 1];
     int offset = 0;
-    int show_len = len > 48 ? 48 : len;
+    int show_len = len > BMS_PROTOCOL_MAX_FRAME_LEN ? BMS_PROTOCOL_MAX_FRAME_LEN : len;
 
     for (int i = 0; i < show_len && offset < (int)sizeof(line); i++) {
         offset += snprintf(line + offset, sizeof(line) - offset, "%02X ", data[i]);
     }
     line[sizeof(line) - 1] = '\0';
-    ESP_LOGI(TAG, "%s len=%d data=%s%s", prefix, len, line, len > 48 ? "..." : "");
+    ESP_LOGI(TAG, "%s len=%d data=%s", prefix, len, line);
 }
 
 static esp_err_t bms_uart_init(void)
@@ -260,11 +261,12 @@ static void accept_parsed_frame(const bms_info_t *parsed, size_t frame_len)
     log_hex_frame("BMS RX frame", s_frame_buffer, (int)frame_len);
     ESP_LOGI(TAG,
              "BMS parsed material=%s softid=%s cell=%u pack=%" PRId32 "mV current=%" PRId32
-             "mA rsoc=%u%% asoc=%u%% soh=%u%% protect=%02X/%02X/%02X",
+             "mA rsoc=%u%% asoc=%u%% soh=%u%% protect=%02X/%02X/%02X battery_code=%s asset=%s",
              bms_material_name(s_bms_info.material), s_bms_info.soft_id, s_bms_info.cell_count,
              s_bms_info.pack_mv, s_bms_info.current_ma, s_bms_info.rsoc_percent,
              s_bms_info.asoc_percent, s_bms_info.soh_percent, s_bms_info.protect_1,
-             s_bms_info.protect_2, s_bms_info.protect_3);
+             s_bms_info.protect_2, s_bms_info.protect_3,
+             s_bms_info.battery_code, s_bms_info.global_asset_number);
     (void)app_state_post_event(VP_APP_EVENT_BMS_RX, (int32_t)frame_len);
     (void)diag_service_update_bms(&s_bms_info);
     consume_frame_bytes(frame_len);
@@ -282,6 +284,29 @@ static bool try_parse_known_length(size_t frame_len)
 
     log_parse_error(err, &parsed, frame_len);
     consume_frame_bytes(1);
+    return true;
+}
+
+static bool try_crc_locked_candidate(size_t frame_len)
+{
+    bms_crc_result_t crc;
+    if (!bms_protocol_crc_is_valid(s_frame_buffer, frame_len, &crc)) {
+        ESP_LOGI(TAG,
+                 "BMS candidate len=%u CRC fail full=0x%04X body=0x%04X rx_le=0x%04X rx_be=0x%04X",
+                 (unsigned)frame_len, crc.calc_full, crc.calc_body, crc.rx_le, crc.rx_be);
+        return false;
+    }
+
+    ESP_LOGI(TAG, "BMS frame len=%u CRC ok", (unsigned)frame_len);
+    bms_info_t parsed;
+    esp_err_t err = parse_frame_candidate(frame_len, &parsed);
+    if (err == ESP_OK) {
+        accept_parsed_frame(&parsed, frame_len);
+    } else {
+        /* CRC 已确认帧边界，字段失败时消费整帧，不能继续拼接后续响应。 */
+        log_parse_error(err, &parsed, frame_len);
+        consume_frame_bytes(frame_len);
+    }
     return true;
 }
 
@@ -311,31 +336,38 @@ static void process_rx_buffer(void)
             continue;
         }
 
+        if (s_frame_len < BMS_PROTOCOL_FRAME_LEN_128) {
+            return;
+        }
+
+        if (try_crc_locked_candidate(BMS_PROTOCOL_FRAME_LEN_128)) {
+            continue;
+        }
+
+        /* 128 字节可能只是 UART 第一段，未收满 130 字节时不能读取后续缓存。 */
         if (s_frame_len < BMS_PROTOCOL_FRAME_LEN_14S) {
             return;
         }
 
-        bms_info_t parsed14;
-        esp_err_t err14 = parse_frame_candidate(BMS_PROTOCOL_FRAME_LEN_14S, &parsed14);
-        if (err14 == ESP_OK) {
-            accept_parsed_frame(&parsed14, BMS_PROTOCOL_FRAME_LEN_14S);
+        if (try_crc_locked_candidate(BMS_PROTOCOL_FRAME_LEN_14S)) {
             continue;
         }
 
-        if (s_frame_len < BMS_PROTOCOL_FRAME_LEN_15S) {
+        if (s_frame_len < BMS_PROTOCOL_FRAME_LEN_132) {
             return;
         }
 
-        bms_info_t parsed15;
-        esp_err_t err15 = parse_frame_candidate(BMS_PROTOCOL_FRAME_LEN_15S, &parsed15);
-        if (err15 == ESP_OK) {
-            accept_parsed_frame(&parsed15, BMS_PROTOCOL_FRAME_LEN_15S);
+        if (try_crc_locked_candidate(BMS_PROTOCOL_FRAME_LEN_132)) {
             continue;
         }
 
-        log_parse_error(err14 == ESP_ERR_INVALID_CRC ? err15 : err14,
-                        err15 == ESP_ERR_INVALID_CRC ? &parsed15 : &parsed14,
-                        BMS_PROTOCOL_FRAME_LEN_15S);
+        bms_info_t failed = s_bms_info;
+        bms_crc_result_t crc;
+        (void)bms_protocol_crc_is_valid(s_frame_buffer, BMS_PROTOCOL_FRAME_LEN_132, &crc);
+        failed.last_crc_calc = crc.calc_body;
+        failed.last_crc_rx_le = crc.rx_le;
+        failed.last_crc_rx_be = crc.rx_be;
+        log_parse_error(ESP_ERR_INVALID_CRC, &failed, BMS_PROTOCOL_FRAME_LEN_132);
         consume_frame_bytes(1);
     }
 }
@@ -352,6 +384,10 @@ static void bms_service_task(void *arg)
         TickType_t now = xTaskGetTickCount();
         if (last_request_tick == 0 ||
             pdTICKS_TO_MS(now - last_request_tick) >= VP_BMS_REQUEST_INTERVAL_MS) {
+            if (s_frame_len > 0) {
+                ESP_LOGW(TAG, "BMS 上一响应残留 len=%u，新请求前清空", (unsigned)s_frame_len);
+                s_frame_len = 0;
+            }
             bms_send_request();
             last_request_tick = now;
         }

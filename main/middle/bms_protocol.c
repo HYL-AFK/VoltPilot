@@ -4,6 +4,9 @@
 #include <string.h>
 
 #include "esp_err.h"
+#include "esp_log.h"
+
+static const char *TAG = "bms_protocol";
 
 enum {
     BMS_BODY_OFF_ID = 0,
@@ -54,6 +57,23 @@ static bms_material_t material_from_soft_id(const uint8_t *soft_id)
     return BMS_MATERIAL_UNKNOWN;
 }
 
+/* 电池编码末两位为材质代码和串数，例如 6E=三元材料-14串。 */
+static bms_material_t material_from_asset_number(const char *asset_number)
+{
+    /* 资产编码示例：EH1241028KNL6E00000037，6E 位于下标 12~13。 */
+    if (asset_number == NULL || strlen(asset_number) < 14) {
+        return BMS_MATERIAL_UNKNOWN;
+    }
+
+    if (asset_number[12] == '6' && asset_number[13] == 'E') {
+        return BMS_MATERIAL_TERNARY_14S;
+    }
+    if (asset_number[12] == '3' && asset_number[13] == 'F') {
+        return BMS_MATERIAL_LFP_15S;
+    }
+    return BMS_MATERIAL_UNKNOWN;
+}
+
 const char *bms_material_name(bms_material_t material)
 {
     switch (material) {
@@ -93,33 +113,142 @@ size_t bms_protocol_expected_len_from_header(const uint8_t *frame, size_t len)
         return 0;
     }
 
-    const uint8_t *soft_id = frame + BMS_PROTOCOL_HEADER_LEN + BMS_BODY_OFF_SOFT_ID;
-    switch (material_from_soft_id(soft_id)) {
-    case BMS_MATERIAL_TERNARY_14S:
-        return BMS_PROTOCOL_FRAME_LEN_14S;
-    case BMS_MATERIAL_LFP_15S:
-        return BMS_PROTOCOL_FRAME_LEN_15S;
-    case BMS_MATERIAL_UNKNOWN:
-    default:
-        return 0;
-    }
+    /* soft_id 不是电池型号，不能用它决定 14S/15S 帧长度。 */
+    return 0;
 }
 
-static bool crc_is_valid(const uint8_t *frame, size_t len, bms_info_t *out_info)
+bool bms_protocol_crc_is_valid(const uint8_t *frame, size_t len, bms_crc_result_t *out_result)
 {
+    if (frame == NULL || len < BMS_PROTOCOL_HEADER_LEN + 2) {
+        return false;
+    }
+
     uint16_t calc = bms_protocol_crc16_modbus(frame, len - 2);
     uint16_t calc_body = bms_protocol_crc16_modbus(frame + BMS_PROTOCOL_HEADER_LEN,
                                                    len - BMS_PROTOCOL_HEADER_LEN - 2);
     uint16_t rx_le = (uint16_t)frame[len - 2] | ((uint16_t)frame[len - 1] << 8);
     uint16_t rx_be = ((uint16_t)frame[len - 2] << 8) | frame[len - 1];
 
-    if (out_info != NULL) {
-        out_info->last_crc_calc = calc == rx_le || calc == rx_be ? calc : calc_body;
-        out_info->last_crc_rx_le = rx_le;
-        out_info->last_crc_rx_be = rx_be;
+    if (out_result != NULL) {
+        out_result->calc_full = calc;
+        out_result->calc_body = calc_body;
+        out_result->rx_le = rx_le;
+        out_result->rx_be = rx_be;
     }
 
     return calc == rx_le || calc == rx_be || calc_body == rx_le || calc_body == rx_be;
+}
+
+static bool ascii_field_is_valid(const uint8_t *data, size_t len)
+{
+    for (size_t i = 0; i < len; i++) {
+        if (data[i] < 0x20 || data[i] > 0x7e) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static esp_err_t parse_body_layout(const uint8_t *body, size_t body_len, uint8_t cell_count,
+                                   const bms_info_t *base, bms_info_t *out_info)
+{
+    size_t cells_bytes = (size_t)cell_count * 2;
+    size_t fixed_body_bytes = BMS_BODY_OFF_CELL_MV + cells_bytes +
+                              (BMS_TEMP_COUNT * 2) + 1 + 1 + 2 + 2 + 2 + 2 +
+                              BMS_BATTERY_CODE_TEXT_LEN + BMS_GLOBAL_ASSET_TEXT_LEN + 1 + 1;
+    if (body_len < fixed_body_bytes) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    size_t status_bytes = body_len - fixed_body_bytes;
+    if (status_bytes < 2 || status_bytes > 6) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    bms_info_t parsed = *base;
+    memset(parsed.cell_mv, 0, sizeof(parsed.cell_mv));
+    memset(parsed.temp_c, 0, sizeof(parsed.temp_c));
+    parsed.material = cell_count == 15 ? BMS_MATERIAL_LFP_15S : BMS_MATERIAL_TERNARY_14S;
+    parsed.cell_count = cell_count;
+    copy_ascii_field(parsed.bms_id, sizeof(parsed.bms_id), body + BMS_BODY_OFF_ID, BMS_ID_TEXT_LEN);
+    copy_ascii_field(parsed.soft_id, sizeof(parsed.soft_id), body + BMS_BODY_OFF_SOFT_ID,
+                     BMS_SOFT_ID_TEXT_LEN);
+    parsed.pack_mv = read_be32_signed(body + BMS_BODY_OFF_PACK_MV);
+    parsed.current_ma = read_be32_signed(body + BMS_BODY_OFF_CURRENT_MA);
+
+    size_t offset = BMS_BODY_OFF_CELL_MV;
+    for (uint8_t i = 0; i < cell_count; i++) {
+        parsed.cell_mv[i] = read_be16(body + offset);
+        if (parsed.cell_mv[i] < 1500 || parsed.cell_mv[i] > 5000) {
+            ESP_LOGI(TAG, "layout=%uS reject cell[%u]=%umV", cell_count, i, parsed.cell_mv[i]);
+            return ESP_ERR_INVALID_RESPONSE;
+        }
+        offset += 2;
+    }
+    for (uint8_t i = 0; i < BMS_TEMP_COUNT; i++) {
+        parsed.temp_c[i] = read_be16_signed(body + offset);
+        if (parsed.temp_c[i] < -40 || parsed.temp_c[i] > 125) {
+            ESP_LOGI(TAG, "layout=%uS reject temp[%u]=%dC", cell_count, i, parsed.temp_c[i]);
+            return ESP_ERR_INVALID_RESPONSE;
+        }
+        offset += 2;
+    }
+
+    parsed.rsoc_percent = body[offset++];
+    parsed.asoc_percent = body[offset++];
+    parsed.soc_permille = (int32_t)parsed.rsoc_percent * 10;
+    parsed.remaining_capacity_mah = read_be16(body + offset);
+    offset += 2;
+    parsed.full_charge_capacity_mah = read_be16(body + offset);
+    offset += 2;
+    parsed.cycle_count = read_be16(body + offset);
+    offset += 2;
+    parsed.soh_percent = read_be16(body + offset);
+    offset += 2;
+    if (parsed.pack_mv <= 0 || parsed.rsoc_percent > 100 || parsed.asoc_percent > 100 ||
+        parsed.soh_percent > 100) {
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+
+    parsed.battery_status = body[offset++];
+    parsed.charge_mos_state = body[offset++];
+    parsed.discharge_mos_state = status_bytes >= 3 ? body[offset++] : 0;
+    parsed.protect_1 = status_bytes >= 4 ? body[offset++] : 0;
+    parsed.protect_2 = status_bytes >= 5 ? body[offset++] : 0;
+    parsed.protect_3 = status_bytes >= 6 ? body[offset++] : 0;
+
+    if (!ascii_field_is_valid(body + offset, BMS_BATTERY_CODE_TEXT_LEN) ||
+        !ascii_field_is_valid(body + offset + BMS_BATTERY_CODE_TEXT_LEN,
+                              BMS_GLOBAL_ASSET_TEXT_LEN)) {
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+    copy_ascii_field(parsed.battery_code, sizeof(parsed.battery_code), body + offset,
+                     BMS_BATTERY_CODE_TEXT_LEN);
+    offset += BMS_BATTERY_CODE_TEXT_LEN;
+    copy_ascii_field(parsed.global_asset_number, sizeof(parsed.global_asset_number), body + offset,
+                     BMS_GLOBAL_ASSET_TEXT_LEN);
+    offset += BMS_GLOBAL_ASSET_TEXT_LEN;
+    parsed.work_mode = body[offset++];
+    parsed.predischarge_mos_state = body[offset++];
+
+    if (offset != body_len) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    *out_info = parsed;
+    ESP_LOGI(TAG, "layout=%uS valid status_bytes=%u asset=%s", cell_count,
+             (unsigned)status_bytes, parsed.global_asset_number);
+    return ESP_OK;
+}
+
+static int64_t pack_voltage_error(const bms_info_t *info)
+{
+    int64_t cell_sum = 0;
+    for (uint8_t i = 0; i < info->cell_count; i++) {
+        cell_sum += info->cell_mv[i];
+    }
+    int64_t error = cell_sum - info->pack_mv;
+    return error < 0 ? -error : error;
 }
 
 esp_err_t bms_protocol_parse(const uint8_t *frame, size_t len, bms_info_t *out_info)
@@ -127,83 +256,79 @@ esp_err_t bms_protocol_parse(const uint8_t *frame, size_t len, bms_info_t *out_i
     if (frame == NULL || out_info == NULL) {
         return ESP_ERR_INVALID_ARG;
     }
-    if (len != BMS_PROTOCOL_FRAME_LEN_14S && len != BMS_PROTOCOL_FRAME_LEN_15S) {
+    if (len != BMS_PROTOCOL_FRAME_LEN_128 && len != BMS_PROTOCOL_FRAME_LEN_14S &&
+        len != BMS_PROTOCOL_FRAME_LEN_132) {
         return ESP_ERR_INVALID_SIZE;
     }
     if (memcmp(frame, BMS_PROTOCOL_HEADER_TEXT, BMS_PROTOCOL_HEADER_LEN) != 0) {
         return ESP_ERR_INVALID_RESPONSE;
     }
-    if (!crc_is_valid(frame, len, out_info)) {
+    bms_crc_result_t crc;
+    if (!bms_protocol_crc_is_valid(frame, len, &crc)) {
+        out_info->last_crc_calc = crc.calc_body;
+        out_info->last_crc_rx_le = crc.rx_le;
+        out_info->last_crc_rx_be = crc.rx_be;
         return ESP_ERR_INVALID_CRC;
     }
+    out_info->last_crc_calc = crc.calc_full == crc.rx_le || crc.calc_full == crc.rx_be
+                                  ? crc.calc_full
+                                  : crc.calc_body;
+    out_info->last_crc_rx_le = crc.rx_le;
+    out_info->last_crc_rx_be = crc.rx_be;
 
     const uint8_t *body = frame + BMS_PROTOCOL_HEADER_LEN;
     size_t body_len = len - BMS_PROTOCOL_HEADER_LEN - 2;
-    uint8_t cell_count = len == BMS_PROTOCOL_FRAME_LEN_15S ? 15 : 14;
-    bms_material_t material = material_from_soft_id(body + BMS_BODY_OFF_SOFT_ID);
+    bms_info_t layout14 = *out_info;
+    bms_info_t layout15 = *out_info;
+    esp_err_t err14 = parse_body_layout(body, body_len, 14, out_info, &layout14);
+    esp_err_t err15 = parse_body_layout(body, body_len, 15, out_info, &layout15);
 
-    if (material == BMS_MATERIAL_TERNARY_14S && len != BMS_PROTOCOL_FRAME_LEN_14S) {
-        return ESP_ERR_INVALID_SIZE;
-    }
-    if (material == BMS_MATERIAL_LFP_15S && len != BMS_PROTOCOL_FRAME_LEN_15S) {
-        return ESP_ERR_INVALID_SIZE;
-    }
-
-    if (material == BMS_MATERIAL_UNKNOWN) {
-        material = len == BMS_PROTOCOL_FRAME_LEN_15S ? BMS_MATERIAL_LFP_15S : BMS_MATERIAL_TERNARY_14S;
+    if (err14 != ESP_OK && err15 != ESP_OK) {
+        return err14 == ESP_ERR_INVALID_RESPONSE || err15 == ESP_ERR_INVALID_RESPONSE
+                   ? ESP_ERR_INVALID_RESPONSE
+                   : ESP_ERR_INVALID_SIZE;
     }
 
-    size_t offset = BMS_BODY_OFF_CELL_MV;
-    size_t cells_bytes = (size_t)cell_count * 2;
-    size_t tail_min = cells_bytes + (BMS_TEMP_COUNT * 2) + 1 + 1 + 2 + 2 + 2 + 2 +
-                      1 + 1 + 1 + 1 + 1 + 1 + BMS_BATTERY_CODE_TEXT_LEN +
-                      BMS_GLOBAL_ASSET_TEXT_LEN + 1 + 1;
-    if (offset + tail_min > body_len) {
-        return ESP_ERR_INVALID_SIZE;
+    bms_info_t *selected = NULL;
+    if (err14 == ESP_OK && err15 != ESP_OK) {
+        selected = &layout14;
+    } else if (err15 == ESP_OK && err14 != ESP_OK) {
+        selected = &layout15;
+    } else {
+        bms_material_t asset14 = material_from_asset_number(layout14.global_asset_number);
+        bms_material_t asset15 = material_from_asset_number(layout15.global_asset_number);
+        if (asset14 == BMS_MATERIAL_TERNARY_14S) {
+            selected = &layout14;
+        } else if (asset15 == BMS_MATERIAL_LFP_15S) {
+            selected = &layout15;
+        } else {
+            bms_material_t soft_material = material_from_soft_id(body + BMS_BODY_OFF_SOFT_ID);
+            if (soft_material == BMS_MATERIAL_TERNARY_14S) {
+                selected = &layout14;
+            } else if (soft_material == BMS_MATERIAL_LFP_15S) {
+                selected = &layout15;
+            } else {
+                selected = pack_voltage_error(&layout14) <= pack_voltage_error(&layout15)
+                               ? &layout14
+                               : &layout15;
+            }
+        }
     }
 
-    memset(out_info->cell_mv, 0, sizeof(out_info->cell_mv));
-    memset(out_info->temp_c, 0, sizeof(out_info->temp_c));
-    out_info->material = material;
-    out_info->cell_count = cell_count;
-    copy_ascii_field(out_info->bms_id, sizeof(out_info->bms_id), body + BMS_BODY_OFF_ID, BMS_ID_TEXT_LEN);
-    copy_ascii_field(out_info->soft_id, sizeof(out_info->soft_id), body + BMS_BODY_OFF_SOFT_ID, BMS_SOFT_ID_TEXT_LEN);
-    out_info->pack_mv = read_be32_signed(body + BMS_BODY_OFF_PACK_MV);
-    out_info->current_ma = read_be32_signed(body + BMS_BODY_OFF_CURRENT_MA);
-
-    for (uint8_t i = 0; i < cell_count; i++) {
-        out_info->cell_mv[i] = read_be16(body + offset);
-        offset += 2;
-    }
-    for (uint8_t i = 0; i < BMS_TEMP_COUNT; i++) {
-        out_info->temp_c[i] = read_be16_signed(body + offset);
-        offset += 2;
+    bms_material_t soft_material = material_from_soft_id(body + BMS_BODY_OFF_SOFT_ID);
+    bms_material_t asset_material = material_from_asset_number(selected->global_asset_number);
+    bms_material_t layout_material = selected->cell_count == 15 ? BMS_MATERIAL_LFP_15S
+                                                                 : BMS_MATERIAL_TERNARY_14S;
+    selected->material = layout_material;
+    if ((soft_material != BMS_MATERIAL_UNKNOWN && soft_material != layout_material) ||
+        (asset_material != BMS_MATERIAL_UNKNOWN && asset_material != layout_material)) {
+        ESP_LOGW(TAG,
+                 "BMS 型号字段不一致 selected=%uS softid=%s asset=%s，保留有效字段布局",
+                 selected->cell_count, selected->soft_id, selected->global_asset_number);
     }
 
-    out_info->rsoc_percent = body[offset++];
-    out_info->asoc_percent = body[offset++];
-    out_info->soc_permille = (int32_t)out_info->rsoc_percent * 10;
-    out_info->remaining_capacity_mah = read_be16(body + offset);
-    offset += 2;
-    out_info->full_charge_capacity_mah = read_be16(body + offset);
-    offset += 2;
-    out_info->cycle_count = read_be16(body + offset);
-    offset += 2;
-    out_info->soh_percent = read_be16(body + offset);
-    offset += 2;
-    out_info->battery_status = body[offset++];
-    out_info->charge_mos_state = body[offset++];
-    out_info->discharge_mos_state = body[offset++];
-    out_info->protect_1 = body[offset++];
-    out_info->protect_2 = body[offset++];
-    out_info->protect_3 = body[offset++];
-    copy_ascii_field(out_info->battery_code, sizeof(out_info->battery_code), body + offset, BMS_BATTERY_CODE_TEXT_LEN);
-    offset += BMS_BATTERY_CODE_TEXT_LEN;
-    copy_ascii_field(out_info->global_asset_number, sizeof(out_info->global_asset_number),
-                     body + offset, BMS_GLOBAL_ASSET_TEXT_LEN);
-    offset += BMS_GLOBAL_ASSET_TEXT_LEN;
-    out_info->work_mode = body[offset++];
-    out_info->predischarge_mos_state = body[offset++];
-
-    return offset == body_len ? ESP_OK : ESP_ERR_INVALID_SIZE;
+    *out_info = *selected;
+    ESP_LOGI(TAG, "selected=%uS asset=%s softid=%s", out_info->cell_count,
+             out_info->global_asset_number, out_info->soft_id);
+    return ESP_OK;
 }

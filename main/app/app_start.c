@@ -23,6 +23,10 @@ static const char *TAG = VP_APP_TAG;
 
 void app_main_start(void)
 {
+    /* BMS RS485 联调阶段：暂时只保留 BMS 服务日志。 */
+    esp_log_level_set("*", ESP_LOG_NONE);
+    esp_log_level_set("bms_service", ESP_LOG_INFO);
+
     ESP_LOGI(TAG, "VoltPilot boot start");
 
     esp_err_t err = board_service_init();

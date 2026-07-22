@@ -125,7 +125,7 @@ static bool start_conditions_ok(void)
     /*
      * 挡位已经可以从 STC 获得，但“挡位 -> 24V/36V/48V 输出”的业务映射还未确认。
      * 因此本轮只完成启动条件诊断，不自动打开任何 EN，避免误上电。
-     */
+    */
     ESP_LOGW(TAG, "启动条件已具备通信基础，但挡位到输出电压的映射未确认，本轮不打开 EN");
 #if VP_ENABLE_MOCK_DEVICES
     ESP_LOGW(TAG, "mock 模式：使用虚拟输出继续验证状态机，真实 EN 保持关闭");
@@ -133,31 +133,6 @@ static bool start_conditions_ok(void)
 #endif
     return false;
 }
-
-#if 0
-static bool stc_interlock_is_safe(void)
-{
-    stc_info_t stc = {0};
-    if (VP_STC_INTERLOCK_INPUT_MASK == 0 || !stc_service_get_info(&stc)) {
-        ESP_LOGE(TAG, "STC 互锁未配置或 STC 不在线，拒绝启动");
-        return false;
-    }
-    if (!stc.io_status_valid) {
-        ESP_LOGW(TAG, "STC 尚未提供有效 IO 状态，拒绝启动");
-        return false;
-    }
-
-    uint16_t masked = stc.io_inputs & VP_STC_INTERLOCK_INPUT_MASK;
-    uint16_t expected = VP_STC_INTERLOCK_ACTIVE_LEVEL ? VP_STC_INTERLOCK_INPUT_MASK : 0;
-    bool safe = masked == expected;
-    if (!safe) {
-        ESP_LOGW(TAG, "STC 互锁不安全 inputs=0x%04X mask=0x%04X expected=0x%04X",
-                 stc.io_inputs, VP_STC_INTERLOCK_INPUT_MASK, expected);
-    }
-    return safe;
-}
-
-#endif
 
 static void handle_button_single(void)
 {
@@ -224,8 +199,10 @@ static void app_state_task(void *arg)
 {
     (void)arg;
     TickType_t last_health = xTaskGetTickCount();
+#if VP_ENABLE_MOCK_DEVICES && VP_MOCK_FORCE_FAULT
     TickType_t boot_tick = last_health;
     bool mock_fault_triggered = false;
+#endif
     (void)watchdog_service_subscribe_current_task("vp_state");
 
     change_state(VP_APP_STATE_STANDBY);

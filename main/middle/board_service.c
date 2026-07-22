@@ -5,6 +5,7 @@
 #include "esp_check.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 
 #include "diag_service.h"
@@ -13,9 +14,24 @@
 static const char *TAG = "board_service";
 
 static board_output_state_t s_output_state;
+static SemaphoreHandle_t s_output_mutex;
 static bool s_board_inited;
 
-static esp_err_t board_set_output(gpio_num_t pin, bool *state, bool enable)
+static esp_err_t output_lock(void)
+{
+    if (s_output_mutex == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    return xSemaphoreTake(s_output_mutex, portMAX_DELAY) == pdTRUE ? ESP_OK : ESP_ERR_TIMEOUT;
+}
+
+static void output_unlock(void)
+{
+    xSemaphoreGive(s_output_mutex);
+}
+
+static esp_err_t board_set_output_locked(gpio_num_t pin, bool *state, bool enable,
+                                         board_output_state_t *out_snapshot)
 {
     if (enable && ((state != &s_output_state.en_24v && s_output_state.en_24v) ||
                    (state != &s_output_state.en_36v && s_output_state.en_36v) ||
@@ -23,10 +39,24 @@ static esp_err_t board_set_output(gpio_num_t pin, bool *state, bool enable)
         ESP_LOGE(TAG, "拒绝同时打开多路输出");
         return ESP_ERR_INVALID_STATE;
     }
-    *state = enable;
+
     esp_err_t err = gpio_set_level(pin, enable ? VP_OUTPUT_ENABLE_ACTIVE_LEVEL : VP_OUTPUT_ENABLE_INACTIVE_LEVEL);
     if (err == ESP_OK) {
-        (void)diag_service_update_outputs(s_output_state);
+        *state = enable;
+        *out_snapshot = s_output_state;
+    }
+    return err;
+}
+
+static esp_err_t board_set_output(gpio_num_t pin, bool *state, bool enable)
+{
+    board_output_state_t snapshot = {0};
+    ESP_RETURN_ON_ERROR(output_lock(), TAG, "输出锁不可用");
+    esp_err_t err = board_set_output_locked(pin, state, enable, &snapshot);
+    output_unlock();
+
+    if (err == ESP_OK) {
+        (void)diag_service_update_outputs(snapshot);
     }
     return err;
 }
@@ -48,16 +78,39 @@ esp_err_t board_output_set_48v(bool enable)
 
 esp_err_t board_output_all_off(void)
 {
-    /* 安全优先：任意故障入口都调用这里，确保三个输出使能全部拉到关闭电平。 */
-    ESP_RETURN_ON_ERROR(board_output_set_24v(false), TAG, "关闭 24V 输出失败");
-    ESP_RETURN_ON_ERROR(board_output_set_36v(false), TAG, "关闭 36V 输出失败");
-    ESP_RETURN_ON_ERROR(board_output_set_48v(false), TAG, "关闭 48V 输出失败");
-    return ESP_OK;
+    /* 安全优先：持锁完成三路关断，期间不允许其他任务重新打开任意 EN。 */
+    ESP_RETURN_ON_ERROR(output_lock(), TAG, "输出锁不可用");
+
+    esp_err_t err_24v = gpio_set_level(VP_OUT_PIN_EN_24V, VP_OUTPUT_ENABLE_INACTIVE_LEVEL);
+    esp_err_t err_36v = gpio_set_level(VP_OUT_PIN_EN_36V, VP_OUTPUT_ENABLE_INACTIVE_LEVEL);
+    esp_err_t err_48v = gpio_set_level(VP_OUT_PIN_EN_48V, VP_OUTPUT_ENABLE_INACTIVE_LEVEL);
+    bool all_off = err_24v == ESP_OK && err_36v == ESP_OK && err_48v == ESP_OK;
+    board_output_state_t snapshot = s_output_state;
+
+    if (all_off) {
+        s_output_state = (board_output_state_t){0};
+        snapshot = s_output_state;
+    }
+    output_unlock();
+
+    if (all_off) {
+        (void)diag_service_update_outputs(snapshot);
+        return ESP_OK;
+    }
+
+    ESP_LOGE(TAG, "关闭输出失败: 24V=%s 36V=%s 48V=%s",
+             esp_err_to_name(err_24v), esp_err_to_name(err_36v), esp_err_to_name(err_48v));
+    return err_24v != ESP_OK ? err_24v : (err_36v != ESP_OK ? err_36v : err_48v);
 }
 
 board_output_state_t board_output_get_state(void)
 {
-    return s_output_state;
+    board_output_state_t snapshot = s_output_state;
+    if (output_lock() == ESP_OK) {
+        snapshot = s_output_state;
+        output_unlock();
+    }
+    return snapshot;
 }
 
 esp_err_t board_virtual_output_request(uint8_t gear)
@@ -154,8 +207,18 @@ esp_err_t board_service_init(void)
              VP_STC_PIN_TX, VP_STC_PIN_RX,
              VP_PIN_SCREEN_BUTTON, VP_PIN_BUZZER_PWM, VP_PIN_LED_GREEN, VP_PIN_LED_RED);
 
-    ESP_RETURN_ON_ERROR(board_gpio_init(), TAG, "GPIO 初始化失败");
-    ESP_RETURN_ON_ERROR(board_buzzer_init(), TAG, "蜂鸣器初始化失败");
+    s_output_mutex = xSemaphoreCreateMutex();
+    ESP_RETURN_ON_FALSE(s_output_mutex != NULL, ESP_ERR_NO_MEM, TAG, "创建输出锁失败");
+
+    esp_err_t err = board_gpio_init();
+    if (err == ESP_OK) {
+        err = board_buzzer_init();
+    }
+    if (err != ESP_OK) {
+        vSemaphoreDelete(s_output_mutex);
+        s_output_mutex = NULL;
+        return err;
+    }
     s_board_inited = true;
 
     ESP_LOGI(TAG, "输出默认关闭，EN 高有效");

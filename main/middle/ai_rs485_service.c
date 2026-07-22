@@ -11,6 +11,19 @@
 static const char *TAG = "ai_rs485";
 static ai_rs485_snapshot_t s_snapshot;
 
+/* 模块当前使用固定两位小数格式：raw=534 表示 5.34V。 */
+static uint16_t raw_to_rounded_voltage_v(uint16_t raw)
+{
+    uint16_t integer = raw / 100;
+    uint16_t tenths = (raw % 100) / 10;
+
+    /* 四舍六入五成双：0~4 舍去，6~9 进位，5 时保留为偶数。 */
+    if (tenths > 5 || (tenths == 5 && (integer & 1U) != 0U)) {
+        integer++;
+    }
+    return integer;
+}
+
 /* Modbus RTU CRC16，低字节先发送。 */
 static uint16_t crc16(const uint8_t *data, size_t len)
 {
@@ -63,9 +76,13 @@ static void poll_task(void *arg)
                 }
                 s_snapshot.online = true;
                 s_snapshot.rx_frames++;
-                ESP_LOGI(TAG, "AI RX channels=%u raw0=%u raw1=%u raw2=%u raw3=%u",
+                ESP_LOGI(TAG, "AI RX channels=%u raw0=%u raw1=%u raw2=%u raw3=%u | V0=%uV V1=%uV V2=%uV V3=%uV",
                          channels, s_snapshot.raw[0], s_snapshot.raw[1],
-                         s_snapshot.raw[2], s_snapshot.raw[3]);
+                         s_snapshot.raw[2], s_snapshot.raw[3],
+                         raw_to_rounded_voltage_v(s_snapshot.raw[0]),
+                         raw_to_rounded_voltage_v(s_snapshot.raw[1]),
+                         raw_to_rounded_voltage_v(s_snapshot.raw[2]),
+                         raw_to_rounded_voltage_v(s_snapshot.raw[3]));
             }
         } else {
             s_snapshot.online = false;

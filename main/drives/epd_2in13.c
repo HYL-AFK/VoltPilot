@@ -17,8 +17,8 @@
 
 static const char *TAG = "epd_2in13";
 
-_Static_assert(VP_EPD_STRIDE_BYTES == 32, "JD79661AA stride must be 32 bytes");
-_Static_assert(VP_EPD_PLANE_SIZE == 8000, "JD79661AA image must be 8000 bytes");
+_Static_assert(VP_EPD_STRIDE_BYTES == 16, "SSD1680 stride must be 16 bytes");
+_Static_assert(VP_EPD_PLANE_SIZE == 4000, "SSD1680 plane must be 4000 bytes");
 
 #if !VP_EPD_USE_SOFTWARE_SPI
 static spi_device_handle_t s_epd_spi;
@@ -152,7 +152,9 @@ static esp_err_t epd_wait_refresh_cycle(void)
 
 static esp_err_t epd_set_ram_cursor(void)
 {
-    return ESP_OK;
+    ESP_RETURN_ON_ERROR(epd_send_command_data(0x4E, (const uint8_t[]){0x00}, 1, "set RAM X"),
+                        TAG, "set RAM X failed");
+    return epd_send_command_data(0x4F, (const uint8_t[]){0x27, 0x01}, 2, "set RAM Y");
 }
 
 static esp_err_t epd_reset(void)
@@ -166,36 +168,31 @@ static esp_err_t epd_reset(void)
 
 static esp_err_t epd_vendor_init_sequence(void)
 {
-    static const uint8_t panel_setting[] = {0x0F, 0x09};
-    static const uint8_t power_setting[] = {0x07, 0x00, 0x22, 0x78, 0x0A, 0x22};
-    static const uint8_t resolution[] = {0x00, 0x80, 0x00, 0xFA};
-    ESP_RETURN_ON_ERROR(epd_send_command_data(0x4D, (const uint8_t[]){0x78}, 1, "lut option"), TAG, "lut option failed");
-    ESP_RETURN_ON_ERROR(epd_send_command_data(0x00, panel_setting, sizeof(panel_setting), "panel setting"), TAG, "panel setting failed");
-    ESP_RETURN_ON_ERROR(epd_send_command_data(0x01, power_setting, sizeof(power_setting), "power setting"), TAG, "power setting failed");
-    ESP_RETURN_ON_ERROR(epd_send_command_data(0x03, (const uint8_t[]){0x10, 0x54, 0x44}, 3, "power sequence"), TAG, "power sequence failed");
-    ESP_RETURN_ON_ERROR(epd_send_command_data(0x06, (const uint8_t[]){0x0F, 0x0A, 0x2F, 0x25, 0x22, 0x2E, 0x21}, 7, "booster"), TAG, "booster failed");
-    ESP_RETURN_ON_ERROR(epd_send_command_data(0x30, (const uint8_t[]){0x02}, 1, "pll"), TAG, "pll failed");
-    ESP_RETURN_ON_ERROR(epd_send_command_data(0x41, (const uint8_t[]){0x00}, 1, "temperature"), TAG, "temperature failed");
-    ESP_RETURN_ON_ERROR(epd_send_command_data(0x50, (const uint8_t[]){0x37}, 1, "vcom"), TAG, "vcom failed");
-    ESP_RETURN_ON_ERROR(epd_send_command_data(0x60, (const uint8_t[]){0x02, 0x02}, 2, "tcon"), TAG, "tcon failed");
-    ESP_RETURN_ON_ERROR(epd_send_command_data(0x61, resolution, sizeof(resolution), "resolution"), TAG, "resolution failed");
-    ESP_RETURN_ON_ERROR(epd_send_command_data(0x65, (const uint8_t[]){0, 0, 0, 0}, 4, "power setting 2"), TAG, "power setting 2 failed");
-    ESP_RETURN_ON_ERROR(epd_send_command_data(0xE7, (const uint8_t[]){0x1C}, 1, "vendor e7"), TAG, "vendor e7 failed");
-    ESP_RETURN_ON_ERROR(epd_send_command_data(0xE3, (const uint8_t[]){0x22}, 1, "vendor e3"), TAG, "vendor e3 failed");
-    ESP_RETURN_ON_ERROR(epd_send_command_data(0xE0, (const uint8_t[]){0x00}, 1, "vendor e0"), TAG, "vendor e0 failed");
-    ESP_RETURN_ON_ERROR(epd_send_command_data(0xB4, (const uint8_t[]){0xD0}, 1, "vendor b4"), TAG, "vendor b4 failed");
-    ESP_RETURN_ON_ERROR(epd_send_command_data(0xB5, (const uint8_t[]){0x03}, 1, "vendor b5"), TAG, "vendor b5 failed");
-    ESP_RETURN_ON_ERROR(epd_send_command_data(0xE9, (const uint8_t[]){0x01}, 1, "vendor e9"), TAG, "vendor e9 failed");
-    return epd_wait_idle("vendor init");
+    ESP_RETURN_ON_ERROR(epd_send_command(0x12), TAG, "SSD1680 software reset failed");
+    ESP_RETURN_ON_ERROR(epd_wait_idle("software reset"), TAG, "software reset wait failed");
+    ESP_RETURN_ON_ERROR(epd_send_command_data(0x01, (const uint8_t[]){0x27, 0x01, 0x01}, 3,
+                                               "driver output control"), TAG, "driver output failed");
+    ESP_RETURN_ON_ERROR(epd_send_command_data(0x11, (const uint8_t[]){0x01}, 1,
+                                               "data entry mode"), TAG, "data entry failed");
+    ESP_RETURN_ON_ERROR(epd_send_command_data(0x44, (const uint8_t[]){0x00, 0x0F}, 2,
+                                               "RAM X range"), TAG, "RAM X range failed");
+    ESP_RETURN_ON_ERROR(epd_send_command_data(0x45, (const uint8_t[]){0x27, 0x01, 0x00, 0x00}, 4,
+                                               "RAM Y range"), TAG, "RAM Y range failed");
+    ESP_RETURN_ON_ERROR(epd_send_command_data(0x3C, (const uint8_t[]){0x05}, 1,
+                                               "border waveform"), TAG, "border waveform failed");
+    ESP_RETURN_ON_ERROR(epd_send_command_data(0x21, (const uint8_t[]){0x00, 0x80}, 2,
+                                               "display update control"), TAG, "display update control failed");
+    ESP_RETURN_ON_ERROR(epd_send_command_data(0x18, (const uint8_t[]){0x80}, 1,
+                                               "temperature sensor"), TAG, "temperature sensor failed");
+    return epd_set_ram_cursor();
 }
 
 static esp_err_t epd_refresh(void)
 {
-    ESP_LOGI(TAG, "refresh JD79661AA flow: power on 0x04, refresh 0x12");
-    ESP_RETURN_ON_ERROR(epd_send_command(0x04), TAG, "power on failed");
-    ESP_RETURN_ON_ERROR(epd_wait_idle("power on"), TAG, "power on wait failed");
-    ESP_RETURN_ON_ERROR(epd_send_command(0x12), TAG, "display refresh failed");
-    ESP_RETURN_ON_ERROR(epd_send_data_byte(0x00), TAG, "display refresh parameter failed");
+    ESP_LOGI(TAG, "refresh SSD1680: update control 0x22=0xF7, activate 0x20");
+    ESP_RETURN_ON_ERROR(epd_send_command_data(0x22, (const uint8_t[]){0xF7}, 1,
+                                               "display update control"), TAG, "update control failed");
+    ESP_RETURN_ON_ERROR(epd_send_command(0x20), TAG, "display update activate failed");
     return epd_wait_idle("display refresh");
 }
 
@@ -283,7 +280,7 @@ esp_err_t epd_2in13_init(void)
 #endif
 
     ESP_LOGI(TAG,
-             "EPD module=%s panel=%s controller=%s four-color packed image_bytes=%u RAM=%dx%d active=%dx%d",
+             "EPD module=%s panel=%s controller=%s black/red planes image_bytes=%u RAM=%dx%d active=%dx%d",
              VP_EPD_MODULE_MODEL, VP_EPD_PANEL_MODEL, VP_EPD_CONTROLLER_NAME,
              (unsigned)VP_EPD_PLANE_SIZE, VP_EPD_RAM_WIDTH, VP_EPD_DRIVER_GATE_COUNT,
              VP_EPD_WIDTH, VP_EPD_HEIGHT);
@@ -293,17 +290,17 @@ esp_err_t epd_2in13_init(void)
              VP_EPD_PIN_RST, VP_EPD_PIN_BUSY, VP_EPD_BUSY_ACTIVE_LEVEL, transport, transport_hz);
 
     ESP_RETURN_ON_ERROR(epd_reset(), TAG, "hardware reset failed");
-    ESP_RETURN_ON_ERROR(epd_vendor_init_sequence(), TAG, "JD79661AA vendor init failed");
+    ESP_RETURN_ON_ERROR(epd_vendor_init_sequence(), TAG, "SSD1680 init failed");
 
-    ESP_LOGI(TAG, "JD79661AA four-color EPD initialized");
+    ESP_LOGI(TAG, "SSD1680 black/white/red EPD initialized");
     return ESP_OK;
 }
 
 esp_err_t epd_2in13_clear(void)
 {
     ESP_RETURN_ON_ERROR(epd_wait_idle("before clear"), TAG, "BUSY before clear failed");
-    ESP_RETURN_ON_ERROR(epd_send_command(0x10), TAG, "clear RAM command failed");
-    ESP_RETURN_ON_ERROR(epd_send_fill(0x55, VP_EPD_PLANE_SIZE, false), TAG, "clear RAM failed");
+    ESP_RETURN_ON_ERROR(epd_fill_plane(0x24, 0xFF, false, "black clear"), TAG, "black clear failed");
+    ESP_RETURN_ON_ERROR(epd_fill_plane(0x26, 0xFF, true, "red clear"), TAG, "red clear failed");
     ESP_RETURN_ON_ERROR(epd_refresh(), TAG, "clear refresh failed");
     ESP_LOGI(TAG, "EPD cleared to white");
     return ESP_OK;
@@ -311,13 +308,13 @@ esp_err_t epd_2in13_clear(void)
 
 esp_err_t epd_2in13_display(const uint8_t *image)
 {
-    ESP_RETURN_ON_FALSE(image != NULL, ESP_ERR_INVALID_ARG, TAG, "four-color image is null");
+    ESP_RETURN_ON_FALSE(image != NULL, ESP_ERR_INVALID_ARG, TAG, "SSD1680 image is null");
 
     ESP_RETURN_ON_ERROR(epd_wait_idle("before display"), TAG, "BUSY before display failed");
-    ESP_RETURN_ON_ERROR(epd_send_command(0x10), TAG, "image RAM command failed");
-    ESP_RETURN_ON_ERROR(epd_send_data(image, VP_EPD_PLANE_SIZE, false), TAG, "image RAM write failed");
-    ESP_RETURN_ON_ERROR(epd_refresh(), TAG, "four-color refresh failed");
-    ESP_LOGI(TAG, "EPD refreshed black/white/yellow/red image");
+    ESP_RETURN_ON_ERROR(epd_write_plane(0x24, image, false, "black"), TAG, "black RAM write failed");
+    ESP_RETURN_ON_ERROR(epd_write_plane(0x26, image + VP_EPD_PLANE_SIZE, true, "red"), TAG, "red RAM write failed");
+    ESP_RETURN_ON_ERROR(epd_refresh(), TAG, "SSD1680 refresh failed");
+    ESP_LOGI(TAG, "EPD refreshed black/white/red image");
     return ESP_OK;
 }
 
