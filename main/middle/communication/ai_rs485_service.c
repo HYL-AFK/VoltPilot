@@ -1,15 +1,20 @@
 #include "ai_rs485_service.h"
 
+#include <string.h>
+
 #include "driver/uart.h"
 #include "esp_check.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
+#include "ai_rs485_health.h"
+#include "app_state_service.h"
 #include "vp_board.h"
 
 static const char *TAG = "ai_rs485";
 static ai_rs485_snapshot_t s_snapshot;
+static vp_ai_rs485_health_t s_health;
 
 /* 模块当前使用固定两位小数格式：raw=534 表示 5.34V。 */
 static uint16_t raw_to_rounded_voltage_v(uint16_t raw)
@@ -37,6 +42,36 @@ static uint16_t crc16(const uint8_t *data, size_t len)
     return crc;
 }
 
+static void note_poll_failure(bool crc_error, const char *reason)
+{
+    if (crc_error) {
+        s_snapshot.crc_errors++;
+    } else {
+        s_snapshot.timeout_count++;
+    }
+
+    vp_ai_rs485_health_event_t event = vp_ai_rs485_health_note_failure(&s_health);
+    s_snapshot.consecutive_failures = s_health.consecutive_failures;
+    s_snapshot.online = vp_ai_rs485_health_is_ready(&s_health);
+    if (event == VP_AI_RS485_HEALTH_OFFLINE) {
+        ESP_LOGW(TAG, "AI RS485 连续%u次失败，判定离线 reason=%s",
+                 (unsigned)s_snapshot.consecutive_failures, reason);
+        (void)app_state_post_event(VP_APP_EVENT_AI_RS485_OFFLINE,
+                                   s_snapshot.consecutive_failures);
+    }
+}
+
+static void note_poll_success(void)
+{
+    vp_ai_rs485_health_event_t event = vp_ai_rs485_health_note_success(&s_health);
+    s_snapshot.consecutive_failures = 0;
+    s_snapshot.online = true;
+    if (event == VP_AI_RS485_HEALTH_RECOVERED) {
+        ESP_LOGI(TAG, "AI RS485 通信恢复，四路电源监测可用");
+        (void)app_state_post_event(VP_APP_EVENT_AI_RS485_RECOVERED, 0);
+    }
+}
+
 static void poll_task(void *arg)
 {
     (void)arg;
@@ -58,14 +93,14 @@ static void poll_task(void *arg)
             uint8_t byte_count = response[2];
             size_t frame_len = 3 + byte_count + 2;
             /* 先校验长度，再访问 CRC 字段，防止异常帧造成越界。 */
-            if (byte_count == 0 || byte_count > VP_AI_RS485_CHANNEL_COUNT * 2 ||
+            if (byte_count != VP_AI_RS485_CHANNEL_COUNT * 2 ||
                 frame_len > (size_t)len) {
-                s_snapshot.crc_errors++;
+                note_poll_failure(true, "response length");
             } else {
                 uint16_t received = (uint16_t)response[frame_len - 2] |
                                     ((uint16_t)response[frame_len - 1] << 8);
                 if (crc16(response, frame_len - 2) != received) {
-                    s_snapshot.crc_errors++;
+                    note_poll_failure(true, "crc");
                     goto poll_delay;
                 }
                 uint8_t channels = byte_count / 2;
@@ -74,7 +109,7 @@ static void poll_task(void *arg)
                     s_snapshot.raw[i] = ((uint16_t)response[3 + i * 2] << 8) |
                                         response[4 + i * 2];
                 }
-                s_snapshot.online = true;
+                note_poll_success();
                 s_snapshot.rx_frames++;
                 ESP_LOGI(TAG, "AI RX channels=%u raw0=%u raw1=%u raw2=%u raw3=%u | V0=%uV V1=%uV V2=%uV V3=%uV",
                          channels, s_snapshot.raw[0], s_snapshot.raw[1],
@@ -85,9 +120,7 @@ static void poll_task(void *arg)
                          raw_to_rounded_voltage_v(s_snapshot.raw[3]));
             }
         } else {
-            s_snapshot.online = false;
-            s_snapshot.timeout_count++;
-            ESP_LOGW(TAG, "AI RS485 timeout count=%u", (unsigned)s_snapshot.timeout_count);
+            note_poll_failure(false, "timeout or unexpected response");
         }
 poll_delay:
         vTaskDelay(pdMS_TO_TICKS(VP_AI_RS485_POLL_INTERVAL_MS));
@@ -101,8 +134,15 @@ bool ai_rs485_service_get_snapshot(ai_rs485_snapshot_t *out_snapshot)
     return s_snapshot.online;
 }
 
+bool ai_rs485_service_is_ready(void)
+{
+    return vp_ai_rs485_health_is_ready(&s_health);
+}
+
 esp_err_t ai_rs485_service_init(void)
 {
+    memset(&s_snapshot, 0, sizeof(s_snapshot));
+    vp_ai_rs485_health_init(&s_health, VP_AI_RS485_FAILURE_LIMIT);
     /* HW-519 类收发器负责 UART-TTL 与 RS485 差分信号转换。 */
     uart_config_t cfg = {
         .baud_rate = VP_AI_RS485_BAUD_RATE,

@@ -13,6 +13,7 @@ typedef enum {
     VP_FAULT_OUTPUT_ERROR,
     VP_FAULT_USER_REQUEST,
     VP_FAULT_STC_VERSION,
+    VP_FAULT_AI_RS485_TIMEOUT,
 } vp_fault_code_t;
 
 esp_err_t fault_service_init(void);

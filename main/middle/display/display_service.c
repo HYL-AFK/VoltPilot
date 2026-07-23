@@ -23,12 +23,14 @@ static const char *TAG = "display_service";
 static uint8_t s_image[VP_EPD_PLANE_SIZE * 2];
 static TaskHandle_t s_display_task;
 static vp_ui_charging_trigger_t s_charging_trigger;
+#if !VP_EPD_UI_DEMO_DATA
 static const vp_ui_charging_trigger_config_t s_charging_trigger_config = {
     .enter_stable_ms = VP_UI_CHARGING_ENTER_STABLE_MS,
     .exit_stable_ms = VP_UI_CHARGING_EXIT_STABLE_MS,
     .enter_soc_percent = VP_UI_CHARGING_ENTER_SOC_PERCENT,
     .exit_soc_percent = VP_UI_CHARGING_EXIT_SOC_PERCENT,
 };
+#endif
 
 _Static_assert(sizeof(s_image) == 8000, "SSD1680 black/red image must be 8000 bytes");
 _Static_assert(sizeof(s_image) == VP_UI_IMAGE_SIZE, "UI image size must match panel RAM");
@@ -65,13 +67,13 @@ static vp_ui_snapshot_t take_snapshot(void)
     return (vp_ui_snapshot_t){
         .bms_valid = true,
         .gear_valid = true,
-        .soc_percent = 10,
-        .gear = 2,
-        .voltage_mv = 55100,
+        .soc_percent = 9,
+        .gear = 1,
+        .voltage_mv = 24000,
         .current_ma = 0,
-        .charge_mos_active = true,
-        .state = VP_UI_STATE_RUNNING,
-        .fault_code = 0,
+        .charge_mos_active = false,
+        .state = VP_UI_STATE_FAULT,
+        .fault_code = 1,
     };
 #else
     bms_info_t bms = {0};

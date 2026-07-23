@@ -13,13 +13,14 @@
 
 /* 功能开关：启用 2.13 寸黑白红三色墨水屏启动测试。 */
 #define VP_ENABLE_DISPLAY 1
-/* 客户界面使用真实 BMS/STC/状态机数据；需要视觉联调时可临时改为 1。 */
-#define VP_EPD_UI_DEMO_DATA 0
+/* 领导演示：固定显示 9% 电量、24V 挡位和故障状态；联调真实设备后改回 0。 */
+#define VP_EPD_UI_DEMO_DATA 1
 #define VP_ENABLE_ADC_SERVICE 1
 #define VP_ENABLE_BMS_SERVICE 1
 #define VP_ENABLE_STC_SERVICE 1
 #define VP_ENABLE_UI_SERVICE 1
 #define VP_ENABLE_STATE_SERVICE 1
+#define VP_ENABLE_USB_DIAG_SERVICE 1
 /* 单板联调时可模拟 BMS/STC；连接真实设备后保持关闭。 */
 #define VP_ENABLE_MOCK_DEVICES 0
 #define VP_ENABLE_VIRTUAL_OUTPUT 1
@@ -69,6 +70,8 @@
 #define VP_AI_RS485_PIN_TX GPIO_NUM_38
 #define VP_AI_RS485_CHANNEL_COUNT 4
 #define VP_AI_RS485_POLL_INTERVAL_MS 1000
+/* 连续三次轮询失败后才判定 AI_RS485 离线，避免单次总线抖动误故障。 */
+#define VP_AI_RS485_FAILURE_LIMIT 3
 
 /* STC8H 板卡到位前，临时由 ESP32 直接读取三档开关。 */
 #define VP_ENABLE_DIRECT_GEAR_SERVICE 0

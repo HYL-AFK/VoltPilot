@@ -49,16 +49,6 @@ static int plane_pixel_count(const uint8_t *image, int plane)
     return count;
 }
 
-static int column_has_pixel(const uint8_t *image, int plane, int x, int y0, int y1)
-{
-    for (int y = y0; y <= y1; ++y) {
-        if (pixel_is_set(image, plane, x, y)) {
-            return 1;
-        }
-    }
-    return 0;
-}
-
 static int glyph_pixel_count(const vp_ui_glyph_t *glyph)
 {
     int count = 0;
@@ -91,14 +81,16 @@ static void test_new_font_subset_is_available(void)
     assert(vp_ui_font_get_glyph(VP_UI_FONT_PERCENT, '%', &glyph));
     for (const char *p = "23468V"; *p != '\0'; ++p) {
         assert(vp_ui_font_get_glyph(VP_UI_FONT_GEAR, *p, &glyph));
-        assert(glyph.height >= 12);
+        assert(glyph.width >= 11);
+        assert(glyph.height == 15);
     }
     for (const char *p = "RPSFO"; *p != '\0'; ++p) {
         assert(vp_ui_font_get_glyph(VP_UI_FONT_STATE, *p, &glyph));
         assert(glyph.height >= 19);
     }
     assert(vp_ui_font_get_glyph(VP_UI_FONT_GEAR, 'V', &glyph));
-    assert(glyph_pixel_count(&glyph) >= 45 && glyph_pixel_count(&glyph) <= 65);
+    assert(glyph.width == 15);
+    assert(glyph_pixel_count(&glyph) >= 50);
     assert(vp_ui_font_get_glyph(VP_UI_FONT_METRIC, '8', &glyph));
     assert(glyph_pixel_count(&glyph) >= 135 && glyph_pixel_count(&glyph) <= 180);
     assert(vp_ui_font_get_glyph(VP_UI_FONT_STATE, 'F', &glyph));
@@ -112,25 +104,25 @@ static void test_layout_matches_confirmed_sketch(void)
     vp_epd_ui_render(&snapshot, image, sizeof(image));
 
     /* 左右主区、底栏和状态小格的固定分隔线。 */
-    assert(pixel_is_set(image, VP_UI_PLANE_BLACK, 170, 40));
-    assert(pixel_is_set(image, VP_UI_PLANE_BLACK, 100, 95));
-    assert(pixel_is_set(image, VP_UI_PLANE_BLACK, 225, 108));
-    for (int x = 226; x < 247; ++x) {
-        assert(!pixel_is_set(image, VP_UI_PLANE_BLACK, x, 117));
+    assert(pixel_is_set(image, VP_UI_PLANE_BLACK, 174, 15));
+    assert(pixel_is_set(image, VP_UI_PLANE_BLACK, 100, 94));
+    assert(pixel_is_set(image, VP_UI_PLANE_BLACK, 224, 108));
+    for (int x = 225; x < 246; ++x) {
+        assert(!pixel_is_set(image, VP_UI_PLANE_BLACK, x, 116));
     }
 
     /* 三档区只占右侧主区约 60%，下半区保持空白。 */
-    assert(pixel_is_set(image, VP_UI_PLANE_BLACK, 200, 23));
-    assert(pixel_is_set(image, VP_UI_PLANE_BLACK, 200, 44));
-    assert(pixel_is_set(image, VP_UI_PLANE_BLACK, 200, 65));
+    assert(pixel_is_set(image, VP_UI_PLANE_BLACK, 200, 24));
+    assert(pixel_is_set(image, VP_UI_PLANE_BLACK, 200, 45));
+    assert(pixel_is_set(image, VP_UI_PLANE_BLACK, 200, 66));
     int lower_row_pixels = 0;
-    for (int x = 171; x < 247; ++x) {
+    for (int x = 174; x < 247; ++x) {
         lower_row_pixels += pixel_is_set(image, VP_UI_PLANE_BLACK, x, 75);
     }
     assert(lower_row_pixels < 40);
 
     /* 十格电量条必须有九条内部竖线。 */
-    static const int dividers[] = {19, 36, 53, 69, 86, 103, 119, 136, 153};
+    static const int dividers[] = {21, 38, 55, 72, 89, 106, 123, 140, 157};
     for (size_t i = 0; i < sizeof(dividers) / sizeof(dividers[0]); ++i) {
         assert(pixel_is_set(image, VP_UI_PLANE_BLACK, dividers[i], 108));
     }
@@ -154,17 +146,100 @@ static void test_outer_frame_is_removed_and_status_keeps_safe_margin(void)
     }
 }
 
-static void test_active_gear_marker_is_nine_pixels_square(void)
+static void test_active_24v_gear_cell_is_fully_filled(void)
 {
     uint8_t image[VP_UI_IMAGE_SIZE];
     vp_ui_snapshot_t snapshot = valid_snapshot();
+    snapshot.gear = 1;
     vp_epd_ui_render(&snapshot, image, sizeof(image));
 
-    for (int y = 30; y <= 38; ++y) {
-        for (int x = 231; x <= 239; ++x) {
+    for (int y = 45; y <= 66; ++y) {
+        for (int x = 224; x <= 245; ++x) {
             assert(pixel_is_set(image, VP_UI_PLANE_BLACK, x, y));
         }
     }
+}
+
+static void test_soc_bar_uses_tall_precise_partial_segments(void)
+{
+    uint8_t image[VP_UI_IMAGE_SIZE];
+    vp_ui_snapshot_t snapshot = valid_snapshot();
+
+    snapshot.soc_percent = 53;
+    vp_epd_ui_render(&snapshot, image, sizeof(image));
+    assert(pixel_is_set(image, VP_UI_PLANE_BLACK, 6, 96));
+    assert(pixel_is_set(image, VP_UI_PLANE_BLACK, 6, 116));
+    assert(!pixel_is_set(image, VP_UI_PLANE_BLACK, 6, 117));
+    assert(pixel_is_set(image, VP_UI_PLANE_BLACK, 94, 107));
+    assert(!pixel_is_set(image, VP_UI_PLANE_BLACK, 95, 107));
+
+    snapshot.soc_percent = 27;
+    vp_epd_ui_render(&snapshot, image, sizeof(image));
+    assert(pixel_is_set(image, VP_UI_PLANE_BLACK, 49, 107));
+    assert(!pixel_is_set(image, VP_UI_PLANE_BLACK, 50, 107));
+}
+
+static void test_soc_bar_uses_ten_equal_width_segments(void)
+{
+    uint8_t image[VP_UI_IMAGE_SIZE];
+    vp_ui_snapshot_t snapshot = valid_snapshot();
+
+    snapshot.soc_percent = 0;
+    vp_epd_ui_render(&snapshot, image, sizeof(image));
+
+    /* 电量条有效宽度为170px，十格均为17px，首个分隔线应固定在x=20。 */
+    assert(!pixel_is_set(image, VP_UI_PLANE_BLACK, 20, 107));
+    assert(pixel_is_set(image, VP_UI_PLANE_BLACK, 21, 107));
+    assert(pixel_is_set(image, VP_UI_PLANE_BLACK, 38, 107));
+    assert(pixel_is_set(image, VP_UI_PLANE_BLACK, 157, 107));
+}
+
+static void test_percent_symbol_has_fixed_lower_right_anchor(void)
+{
+    uint8_t image[VP_UI_IMAGE_SIZE];
+    vp_ui_snapshot_t snapshot = valid_snapshot();
+
+    snapshot.soc_percent = 55;
+    vp_epd_ui_render(&snapshot, image, sizeof(image));
+    assert(pixel_is_set(image, VP_UI_PLANE_BLACK, 147, 69));
+
+    snapshot.soc_percent = 7;
+    vp_epd_ui_render(&snapshot, image, sizeof(image));
+    assert(pixel_is_set(image, VP_UI_PLANE_RED, 147, 69));
+}
+
+static void test_voltage_uses_a_square_decimal_point(void)
+{
+    uint8_t image[VP_UI_IMAGE_SIZE];
+    vp_ui_snapshot_t snapshot = valid_snapshot();
+    snapshot.voltage_mv = 24000;
+    vp_epd_ui_render(&snapshot, image, sizeof(image));
+
+    int whole_width = vp_ui_font_measure(VP_UI_FONT_METRIC, "24");
+    int fraction_width = vp_ui_font_measure(VP_UI_FONT_METRIC, "0");
+    int unit_width = vp_ui_font_measure(VP_UI_FONT_GEAR, "V");
+    int total_width = whole_width + 2 + 4 + 2 + fraction_width + 2 + unit_width;
+    int dot_x = 210 - total_width / 2 + whole_width + 2;
+    for (int y = 84; y <= 87; ++y) {
+        for (int x = dot_x; x < dot_x + 4; ++x) {
+            assert(pixel_is_set(image, VP_UI_PLANE_BLACK, x, y));
+        }
+    }
+}
+
+static void test_voltage_unit_shares_the_numeric_baseline(void)
+{
+    uint8_t image[VP_UI_IMAGE_SIZE];
+    vp_ui_snapshot_t snapshot = valid_snapshot();
+    snapshot.voltage_mv = 24000;
+    vp_epd_ui_render(&snapshot, image, sizeof(image));
+
+    int whole_width = vp_ui_font_measure(VP_UI_FONT_METRIC, "24");
+    int fraction_width = vp_ui_font_measure(VP_UI_FONT_METRIC, "0");
+    int unit_width = vp_ui_font_measure(VP_UI_FONT_GEAR, "V");
+    int total_width = whole_width + 2 + 4 + 2 + fraction_width + 2 + unit_width;
+    int unit_x = 210 - total_width / 2 + whole_width + 8 + fraction_width + 2;
+    assert(pixel_is_set(image, VP_UI_PLANE_BLACK, unit_x + 1, 74));
 }
 
 static void test_soc_is_large_and_normal_screen_has_no_red(void)
@@ -180,22 +255,20 @@ static void test_soc_is_large_and_normal_screen_has_no_red(void)
         }
     }
     assert(soc_pixels > 1300);
-    /* 100 按“1”和“00”两个字块紧凑绘制，不能保留原来的 17px 空洞。 */
-    assert(column_has_pixel(image, VP_UI_PLANE_BLACK, 58, 10, 80));
     assert(plane_pixel_count(image, VP_UI_PLANE_RED) == 0);
 
     int top = VP_UI_HEIGHT;
     int bottom = -1;
-    for (int y = 0; y < 95; ++y) {
-        for (int x = 3; x < 170; ++x) {
+    for (int y = 0; y < 94; ++y) {
+        for (int x = 3; x < 173; ++x) {
             if (pixel_is_set(image, VP_UI_PLANE_BLACK, x, y)) {
                 if (y < top) top = y;
                 if (y > bottom) bottom = y;
             }
         }
     }
-    assert(top <= 10);
-    assert(bottom <= 84);
+    assert(top <= 11);
+    assert(bottom <= 89);
 }
 
 static void test_low_soc_and_fault_are_the_only_red_states(void)
@@ -215,16 +288,20 @@ static void test_low_soc_and_fault_are_the_only_red_states(void)
     snapshot.soc_percent = 78;
     snapshot.state = VP_UI_STATE_FAULT;
     vp_epd_ui_render(&snapshot, image, sizeof(image));
-    for (int y = 97; y <= 119; ++y) {
-        for (int x = 172; x <= 223; ++x) {
+    for (int y = 96; y <= 116; ++y) {
+        for (int x = 176; x <= 222; ++x) {
             assert(pixel_is_set(image, VP_UI_PLANE_RED, x, y));
         }
     }
+    assert(!pixel_is_set(image, VP_UI_PLANE_RED, 175, 108));
+    assert(!pixel_is_set(image, VP_UI_PLANE_RED, 223, 108));
+    assert(!pixel_is_set(image, VP_UI_PLANE_RED, 180, 118));
+    assert(!pixel_is_set(image, VP_UI_PLANE_RED, 180, 119));
     assert(!pixel_is_set(image, VP_UI_PLANE_RED, 171, 108));
     assert(!pixel_is_set(image, VP_UI_PLANE_RED, 224, 108));
-    assert(!pixel_is_set(image, VP_UI_PLANE_RED, 180, 96));
+    assert(!pixel_is_set(image, VP_UI_PLANE_RED, 180, 95));
     assert(!pixel_is_set(image, VP_UI_PLANE_RED, 180, 120));
-    assert(plane_pixel_count(image, VP_UI_PLANE_RED) == 52 * 23);
+    assert(plane_pixel_count(image, VP_UI_PLANE_RED) == 47 * 21);
 }
 
 static void test_voltage_appears_below_gear_rows(void)
@@ -258,13 +335,13 @@ static void test_low_soc_charge_mos_uses_charging_page_and_fault_wins(void)
     vp_ui_snapshot_t snapshot = valid_snapshot();
     snapshot.soc_percent = 10;
     vp_epd_ui_render(&snapshot, image, sizeof(image));
-    assert(pixel_is_set(image, VP_UI_PLANE_BLACK, 170, 40));
+    assert(pixel_is_set(image, VP_UI_PLANE_BLACK, 174, 15));
 
     snapshot.charge_mos_active = true;
     vp_epd_ui_render(&snapshot, image, sizeof(image));
 
     /* 充电页不保留主页面分隔线，只显示放大的电池和闪电图形。 */
-    assert(!pixel_is_set(image, VP_UI_PLANE_BLACK, 170, 40));
+    assert(!pixel_is_set(image, VP_UI_PLANE_BLACK, 174, 15));
     assert(pixel_is_set(image, VP_UI_PLANE_BLACK, 30, 27));
     assert(pixel_is_set(image, VP_UI_PLANE_BLACK, 30, 94));
     assert(pixel_is_set(image, VP_UI_PLANE_RED, 34, 38));
@@ -280,12 +357,12 @@ static void test_low_soc_charge_mos_uses_charging_page_and_fault_wins(void)
 
     snapshot.soc_percent = 20;
     vp_epd_ui_render(&snapshot, image, sizeof(image));
-    assert(pixel_is_set(image, VP_UI_PLANE_BLACK, 170, 40));
+    assert(pixel_is_set(image, VP_UI_PLANE_BLACK, 174, 15));
 
     snapshot.soc_percent = 10;
     snapshot.state = VP_UI_STATE_FAULT;
     vp_epd_ui_render(&snapshot, image, sizeof(image));
-    assert(pixel_is_set(image, VP_UI_PLANE_BLACK, 170, 40));
+    assert(pixel_is_set(image, VP_UI_PLANE_BLACK, 174, 15));
     assert(pixel_is_set(image, VP_UI_PLANE_RED, 180, 108));
 }
 
@@ -317,7 +394,12 @@ int main(void)
     test_render_stays_inside_exact_framebuffer();
     test_layout_matches_confirmed_sketch();
     test_outer_frame_is_removed_and_status_keeps_safe_margin();
-    test_active_gear_marker_is_nine_pixels_square();
+    test_active_24v_gear_cell_is_fully_filled();
+    test_soc_bar_uses_tall_precise_partial_segments();
+    test_soc_bar_uses_ten_equal_width_segments();
+    test_percent_symbol_has_fixed_lower_right_anchor();
+    test_voltage_uses_a_square_decimal_point();
+    test_voltage_unit_shares_the_numeric_baseline();
     test_soc_is_large_and_normal_screen_has_no_red();
     test_low_soc_and_fault_are_the_only_red_states();
     test_voltage_appears_below_gear_rows();

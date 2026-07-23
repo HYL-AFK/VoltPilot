@@ -2,8 +2,8 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).parents[1]
-FONT_HEADER = ROOT / "main" / "middle" / "epd_ui_font.h"
-FONT_SOURCE = ROOT / "main" / "middle" / "epd_ui_font.c"
+FONT_HEADER = ROOT / "main" / "middle" / "display" / "epd_ui_font.h"
+FONT_SOURCE = ROOT / "main" / "middle" / "display" / "epd_ui_font.c"
 
 
 def test_generated_font_keeps_only_renderer_subsets() -> None:

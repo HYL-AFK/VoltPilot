@@ -2,27 +2,37 @@ idf_component_register(
     SRCS
         "main.c"
         "app/app_start.c"
-        "middle/adc_service.c"
-        "middle/ai_rs485_service.c"
-        "middle/app_state_service.c"
-        "middle/bms_protocol.c"
-        "middle/bms_service.c"
-        "middle/board_service.c"
-        "middle/diag_service.c"
-        "middle/display_service.c"
-        "middle/epd_ui_font.c"
-        "middle/epd_ui_renderer.c"
-        "middle/epd_ui_trigger.c"
-        "middle/fault_service.c"
-        "middle/stc_protocol.c"
-        "middle/stc_service.c"
-        "middle/ui_service.c"
-        "middle/watchdog_service.c"
+        "middle/acquisition/adc_service.c"
+        "middle/communication/ai_rs485_service.c"
+        "middle/communication/ai_rs485_health.c"
+        "middle/communication/bms_protocol.c"
+        "middle/communication/bms_service.c"
+        "middle/communication/stc_protocol.c"
+        "middle/communication/stc_service.c"
+        "middle/control/app_state_service.c"
+        "middle/control/fault_service.c"
+        "middle/control/watchdog_service.c"
+        "middle/diagnostics/diag_service.c"
+        "middle/diagnostics/runtime_history.c"
+        "middle/diagnostics/usb_diag_command.c"
+        "middle/diagnostics/usb_diag_service.c"
+        "middle/display/display_service.c"
+        "middle/display/epd_ui_font.c"
+        "middle/display/epd_ui_renderer.c"
+        "middle/display/epd_ui_trigger.c"
+        "middle/display/ui_service.c"
+        "middle/hardware/board_service.c"
         "drives/epd_2in13.c"
     INCLUDE_DIRS
         "."
         "app"
         "middle"
+        "middle/acquisition"
+        "middle/communication"
+        "middle/control"
+        "middle/diagnostics"
+        "middle/display"
+        "middle/hardware"
         "drives"
         "common"
     REQUIRES
@@ -30,6 +40,7 @@ idf_component_register(
         esp_driver_spi
         esp_driver_uart
         esp_driver_ledc
+        esp_driver_usb_serial_jtag
         esp_adc
         esp_app_format
         esp_system

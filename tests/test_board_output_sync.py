@@ -2,7 +2,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).parents[1]
-SOURCE = (ROOT / "main" / "middle" / "board_service.c").read_text(encoding="utf-8")
+SOURCE = (ROOT / "main" / "middle" / "hardware" / "board_service.c").read_text(encoding="utf-8")
 
 
 def _function_body(name: str) -> str:

@@ -10,6 +10,7 @@
 #include "freertos/task.h"
 
 #include "board_service.h"
+#include "ai_rs485_service.h"
 #include "bms_service.h"
 #include "diag_service.h"
 #include "fault_service.h"
@@ -99,6 +100,11 @@ static bool start_conditions_ok(void)
 
     if (!stc_online) {
         ESP_LOGW(TAG, "启动条件未满足：STC 还没有有效响应，禁止打开输出");
+        return false;
+    }
+
+    if (!ai_rs485_service_is_ready()) {
+        ESP_LOGW(TAG, "启动条件未满足：AI_RS485 四路电源监测离线，禁止启动");
         return false;
     }
 
@@ -236,6 +242,19 @@ static void app_state_task(void *arg)
             case VP_APP_EVENT_BMS_TIMEOUT:
             case VP_APP_EVENT_STC_TIMEOUT:
                 handle_timeout_event(event.id);
+                break;
+            case VP_APP_EVENT_AI_RS485_OFFLINE:
+                if (s_state == VP_APP_STATE_RUNNING) {
+                    fault_service_raise(VP_FAULT_AI_RS485_TIMEOUT, "AI_RS485");
+                    change_state(VP_APP_STATE_FAULT);
+                } else {
+                    ESP_LOGW(TAG, "AI_RS485 离线：待机告警，运行启动将被禁止");
+                    (void)diag_service_record_event(VP_DIAG_EVENT_AI_RS485_OFFLINE);
+                }
+                break;
+            case VP_APP_EVENT_AI_RS485_RECOVERED:
+                ESP_LOGI(TAG, "AI_RS485 已恢复；如处于FAULT仍需长按人工清除");
+                (void)diag_service_record_event(VP_DIAG_EVENT_AI_RS485_RECOVERED);
                 break;
             case VP_APP_EVENT_FAULT:
                 fault_service_raise((vp_fault_code_t)event.value, "event");

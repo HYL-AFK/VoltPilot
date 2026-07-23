@@ -11,11 +11,14 @@
 #include "bms_service.h"
 #include "board_service.h"
 #include "fault_service.h"
+#include "runtime_history.h"
 #include "stc_service.h"
 
 #define VP_DIAG_FAULT_SOURCE_LEN 16
 #define VP_DIAG_TASK_NAME_LEN 12
 #define VP_DIAG_WDT_TASK_COUNT 8
+#define VP_DIAG_EVENT_AI_RS485_OFFLINE 0xA1000001U
+#define VP_DIAG_EVENT_AI_RS485_RECOVERED 0xA1000002U
 
 typedef struct {
     char name[VP_DIAG_TASK_NAME_LEN];
@@ -81,8 +84,15 @@ typedef struct {
 } vp_diag_registers_t;
 
 esp_err_t diag_service_init(void);
+/* 每秒采样运行状态；由应用主循环调用，不依赖任意通信服务。 */
+esp_err_t diag_service_tick(void);
 esp_err_t diag_service_get_snapshot(vp_diag_registers_t *out_snapshot);
+size_t diag_service_runtime_history_count(void);
+esp_err_t diag_service_get_runtime_history(size_t index, vp_runtime_history_record_t *out_record);
+esp_err_t diag_service_get_runtime_summary(vp_runtime_history_summary_t *out_summary);
 esp_err_t diag_service_record_fault(vp_fault_code_t code, const char *source);
+/* 记录非故障状态的关键诊断事件，不改变当前 fault_code。 */
+esp_err_t diag_service_record_event(uint32_t event_code);
 esp_err_t diag_service_capture_fault_outputs(board_output_state_t outputs);
 esp_err_t diag_service_update_state(vp_app_state_t state,
                                     vp_fault_code_t fault,

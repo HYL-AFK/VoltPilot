@@ -27,6 +27,8 @@ const char *fault_service_code_name(vp_fault_code_t code)
         return "USER_REQUEST";
     case VP_FAULT_STC_VERSION:
         return "STC_VERSION";
+    case VP_FAULT_AI_RS485_TIMEOUT:
+        return "AI_RS485_TIMEOUT";
     default:
         return "UNKNOWN";
     }

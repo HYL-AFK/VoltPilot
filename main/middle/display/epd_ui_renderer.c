@@ -11,6 +11,20 @@ typedef enum {
     UI_RED = VP_UI_PLANE_RED,
 } ui_color_t;
 
+enum {
+    UI_LEFT_X = 4,
+    UI_LEFT_WIDTH = 170,
+    UI_MAIN_DIVIDER_X = UI_LEFT_X + UI_LEFT_WIDTH,
+    UI_RIGHT_X = UI_MAIN_DIVIDER_X + 1,
+    UI_RIGHT_END_X = 245,
+    UI_GEAR_CELL_X = 224,
+    UI_SOC_CENTER_X = 89,
+    UI_PERCENT_X = 144,
+    UI_PERCENT_Y = 60,
+    UI_PERCENT_WIDTH = 19,
+    UI_PERCENT_HEIGHT = 25,
+};
+
 static void pixel(uint8_t *image, ui_color_t color, int x, int y)
 {
     if (image == NULL || x < 0 || x >= VP_UI_WIDTH || y < 0 || y >= VP_UI_HEIGHT) {
@@ -75,6 +89,25 @@ static void draw_text(uint8_t *image, ui_color_t color, vp_ui_font_id_t font,
     }
 }
 
+static void draw_percent(uint8_t *image, ui_color_t color)
+{
+    vp_ui_glyph_t glyph;
+    if (!vp_ui_font_get_glyph(VP_UI_FONT_PERCENT, '%', &glyph)) {
+        return;
+    }
+
+    for (int row = 0; row < UI_PERCENT_HEIGHT; ++row) {
+        int source_row = row * glyph.height / UI_PERCENT_HEIGHT;
+        for (int col = 0; col < UI_PERCENT_WIDTH; ++col) {
+            int source_col = col * glyph.width / UI_PERCENT_WIDTH;
+            size_t offset = (size_t)source_row * glyph.stride + (size_t)(source_col / 8);
+            if ((glyph.bitmap[offset] & (uint8_t)(0x80U >> (source_col % 8))) != 0) {
+                pixel(image, color, UI_PERCENT_X + col, UI_PERCENT_Y + glyph.y_offset + row);
+            }
+        }
+    }
+}
+
 static void centered_text(uint8_t *image, ui_color_t color, vp_ui_font_id_t font,
                           int center_x, int y, const char *value)
 {
@@ -95,85 +128,102 @@ static char state_abbreviation(vp_ui_state_t state)
 static void draw_soc(uint8_t *image, const vp_ui_snapshot_t *snapshot)
 {
     if (!snapshot->bms_valid || snapshot->soc_percent > 100) {
-        centered_text(image, UI_BLACK, VP_UI_FONT_METRIC, 86, 31, "--");
+        centered_text(image, UI_BLACK, VP_UI_FONT_METRIC, UI_SOC_CENTER_X, 31, "--");
         return;
     }
 
     char value[4];
     snprintf(value, sizeof(value), "%u", snapshot->soc_percent);
     int value_width = vp_ui_font_measure(VP_UI_FONT_SOC, value);
-    int percent_width = vp_ui_font_measure(VP_UI_FONT_PERCENT, "%");
-    const int hundred_kerning = snapshot->soc_percent == 100 ? 20 : 0;
+    const int hundred_kerning = snapshot->soc_percent == 100 ? 10 : 0;
     value_width -= hundred_kerning;
-    int total_width = value_width + 2 + percent_width;
-    int x = 86 - total_width / 2;
+    int x = UI_SOC_CENTER_X - value_width / 2;
+    if (snapshot->soc_percent == 100) {
+        x -= 10;
+    }
     ui_color_t color = snapshot->soc_percent < 20 ? UI_RED : UI_BLACK;
     if (snapshot->soc_percent == 100) {
         int one_width = vp_ui_font_measure(VP_UI_FONT_SOC, "1");
-        draw_text(image, color, VP_UI_FONT_SOC, x, -7, "1");
-        draw_text(image, color, VP_UI_FONT_SOC, x + one_width - hundred_kerning, -7, "00");
+        draw_text(image, color, VP_UI_FONT_SOC, x, -6, "1");
+        draw_text(image, color, VP_UI_FONT_SOC, x + one_width - hundred_kerning, -6, "00");
     } else {
-        draw_text(image, color, VP_UI_FONT_SOC, x, -7, value);
+        draw_text(image, color, VP_UI_FONT_SOC, x, -6, value);
     }
-    draw_text(image, color, VP_UI_FONT_PERCENT, x + value_width + 2, 42, "%");
+    /* 单位独立锚定在 SOC 区右下侧，数值位数变化不会带动它移动。 */
+    draw_percent(image, color);
 }
 
 static void draw_gear_rows(uint8_t *image, const vp_ui_snapshot_t *snapshot)
 {
     static const char *labels[] = {"48V", "36V", "24V"};
     static const uint8_t gears[] = {3, 2, 1};
-    static const int row_top[] = {3, 24, 45};
+    static const int row_top[] = {4, 25, 46};
 
-    hline(image, UI_BLACK, 171, 246, 23);
-    hline(image, UI_BLACK, 171, 246, 44);
-    hline(image, UI_BLACK, 171, 246, 65);
-    vline(image, UI_BLACK, 225, 3, 65);
+    hline(image, UI_BLACK, UI_RIGHT_X, UI_RIGHT_END_X, 24);
+    hline(image, UI_BLACK, UI_RIGHT_X, UI_RIGHT_END_X, 45);
+    hline(image, UI_BLACK, UI_RIGHT_X, UI_RIGHT_END_X, 66);
+    vline(image, UI_BLACK, UI_GEAR_CELL_X, 4, 66);
 
     for (size_t i = 0; i < 3; ++i) {
-        draw_text(image, UI_BLACK, VP_UI_FONT_GEAR, 181, row_top[i] - 1, labels[i]);
+        draw_text(image, UI_BLACK, VP_UI_FONT_GEAR, 185, row_top[i] - 1, labels[i]);
         if (snapshot->gear_valid && snapshot->gear == gears[i]) {
-            fill_rect(image, UI_BLACK, 231, row_top[i] + 6, 9, 9);
+            fill_rect(image, UI_BLACK, UI_GEAR_CELL_X, row_top[i] - 1, 22, 22);
         }
     }
 }
 
 static void draw_soc_segments(uint8_t *image, const vp_ui_snapshot_t *snapshot)
 {
-    const int area_x = 3;
-    const int area_width = 167;
-    int active = snapshot->bms_valid && snapshot->soc_percent <= 100 ?
-                 (snapshot->soc_percent + 9) / 10 : 0;
+    const int segment_width = UI_LEFT_WIDTH / 10;
+    int full_segments = snapshot->bms_valid && snapshot->soc_percent <= 100 ?
+                        snapshot->soc_percent / 10 : 0;
+    int remainder = snapshot->bms_valid && snapshot->soc_percent <= 100 ?
+                    snapshot->soc_percent % 10 : 0;
     ui_color_t fill_color = snapshot->bms_valid && snapshot->soc_percent < 20 ?
                             UI_RED : UI_BLACK;
 
     for (int i = 0; i < 10; ++i) {
-        int x0 = area_x + (area_width * i) / 10;
-        int x1 = area_x + (area_width * (i + 1)) / 10;
+        int x0 = UI_LEFT_X + segment_width * i;
+        int x1 = x0 + segment_width;
         if (i > 0) {
-            vline(image, UI_BLACK, x0, 96, 118);
+            vline(image, UI_BLACK, x0, 95, 117);
         }
-        if (i < active) {
-            fill_rect(image, fill_color, x0 + 2, 98, x1 - x0 - 3, 19);
+        int inner_x = x0 + 2;
+        int inner_width = x1 - x0 - 3;
+        int fill_width = 0;
+        if (i < full_segments) {
+            fill_width = inner_width;
+        } else if (i == full_segments && remainder > 0) {
+            fill_width = (inner_width * remainder + 5) / 10;
+        }
+        if (fill_width > 0) {
+            fill_rect(image, fill_color, inner_x, 96, fill_width, 21);
         }
     }
 }
 
 static void draw_voltage(uint8_t *image, const vp_ui_snapshot_t *snapshot)
 {
-    char value[12];
+    char whole[8];
+    char fraction[2];
     if (!snapshot->bms_valid || snapshot->voltage_mv < 0 || snapshot->voltage_mv > 999900) {
-        memcpy(value, "--.-", 5);
+        memcpy(whole, "--", 3);
+        memcpy(fraction, "-", 2);
     } else {
-        snprintf(value, sizeof(value), "%ld.%01ld",
-                 (long)(snapshot->voltage_mv / 1000),
+        snprintf(whole, sizeof(whole), "%ld", (long)(snapshot->voltage_mv / 1000));
+        snprintf(fraction, sizeof(fraction), "%01ld",
                  labs((long)(snapshot->voltage_mv % 1000)) / 100);
     }
 
-    int value_width = vp_ui_font_measure(VP_UI_FONT_METRIC, value);
+    int whole_width = vp_ui_font_measure(VP_UI_FONT_METRIC, whole);
+    int fraction_width = vp_ui_font_measure(VP_UI_FONT_METRIC, fraction);
     int unit_width = vp_ui_font_measure(VP_UI_FONT_GEAR, "V");
-    int x = 209 - (value_width + 2 + unit_width) / 2;
-    draw_text(image, UI_BLACK, VP_UI_FONT_METRIC, x, 64, value);
-    draw_text(image, UI_BLACK, VP_UI_FONT_GEAR, x + value_width + 2, 74, "V");
+    int total_width = whole_width + 2 + 4 + 2 + fraction_width + 2 + unit_width;
+    int x = 210 - total_width / 2;
+    draw_text(image, UI_BLACK, VP_UI_FONT_METRIC, x, 64, whole);
+    fill_rect(image, UI_BLACK, x + whole_width + 2, 84, 4, 4);
+    draw_text(image, UI_BLACK, VP_UI_FONT_METRIC, x + whole_width + 8, 64, fraction);
+    draw_text(image, UI_BLACK, VP_UI_FONT_GEAR, x + whole_width + 8 + fraction_width + 2, 72, "V");
 }
 
 static void draw_lightning(uint8_t *image)
@@ -241,10 +291,10 @@ void vp_epd_ui_render(const vp_ui_snapshot_t *snapshot, uint8_t *image, size_t i
         return;
     }
 
-    vline(image, UI_BLACK, 170, 3, 94);
-    hline(image, UI_BLACK, 3, 246, 95);
-    vline(image, UI_BLACK, 170, 96, 118);
-    vline(image, UI_BLACK, 225, 96, 118);
+    vline(image, UI_BLACK, UI_MAIN_DIVIDER_X, 4, 93);
+    hline(image, UI_BLACK, UI_LEFT_X, UI_RIGHT_END_X, 94);
+    vline(image, UI_BLACK, UI_MAIN_DIVIDER_X, 95, 117);
+    vline(image, UI_BLACK, UI_GEAR_CELL_X, 95, 117);
 
     draw_soc(image, snapshot);
     draw_gear_rows(image, snapshot);
@@ -252,11 +302,11 @@ void vp_epd_ui_render(const vp_ui_snapshot_t *snapshot, uint8_t *image, size_t i
     draw_soc_segments(image, snapshot);
 
     if (snapshot->state == VP_UI_STATE_FAULT) {
-        fill_rect(image, UI_RED, 172, 97, 52, 23);
+        fill_rect(image, UI_RED, UI_RIGHT_X + 1, 96, UI_GEAR_CELL_X - UI_RIGHT_X - 2, 21);
     }
 
     char state[2] = {state_abbreviation(snapshot->state), '\0'};
-    centered_text(image, UI_BLACK, VP_UI_FONT_STATE, 236, 92, state);
+    centered_text(image, UI_BLACK, VP_UI_FONT_STATE, 235, 91, state);
 }
 
 bool vp_epd_ui_fault_changed(const vp_ui_snapshot_t *old_value,

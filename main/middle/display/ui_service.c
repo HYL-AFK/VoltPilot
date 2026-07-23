@@ -22,23 +22,31 @@ static void led_task(void *arg)
     bool blink_on = false;
     (void)watchdog_service_subscribe_current_task("vp_led");
 
-    while (true) {
+    while (true)
+    {
         vp_app_state_t state = app_state_service_get_state();
         board_status_led_t led_state = BOARD_STATUS_LED_OFF;
         uint32_t period_ms = 250;
 
-        if (fault_service_has_fault() || state == VP_APP_STATE_FAULT) {
+        if (fault_service_has_fault() || state == VP_APP_STATE_FAULT)
+        {
             led_state = BOARD_STATUS_LED_RED;
             blink_on = false;
             period_ms = 500;
-        } else if (state == VP_APP_STATE_PREPARE) {
+        }
+        else if (state == VP_APP_STATE_PREPARE)
+        {
             blink_on = !blink_on;
             led_state = blink_on ? BOARD_STATUS_LED_GREEN : BOARD_STATUS_LED_OFF;
-        } else if (state == VP_APP_STATE_RUNNING) {
+        }
+        else if (state == VP_APP_STATE_RUNNING)
+        {
             led_state = BOARD_STATUS_LED_GREEN;
             blink_on = false;
             period_ms = 500;
-        } else {
+        }
+        else
+        {
             blink_on = false;
             period_ms = 500;
         }
@@ -52,7 +60,8 @@ static void led_task(void *arg)
 static void post_button_event(vp_app_event_id_t id)
 {
     esp_err_t err = app_state_post_event(id, 0);
-    if (err != ESP_OK) {
+    if (err != ESP_OK)
+    {
         ESP_LOGW(TAG, "按键事件投递失败: %s", esp_err_to_name(err));
     }
 }
@@ -69,35 +78,44 @@ static void button_task(void *arg)
     bool long_reported = false;
     (void)watchdog_service_subscribe_current_task("vp_button");
 
-    while (true) {
+    while (true)
+    {
         TickType_t now = xTaskGetTickCount();
         int sample = gpio_get_level(VP_PIN_SCREEN_BUTTON);
 
-        if (sample != last_sample) {
+        if (sample != last_sample)
+        {
             last_sample = sample;
             last_change = now;
         }
 
         if (sample != stable_level &&
-            pdTICKS_TO_MS(now - last_change) >= VP_INPUT_DEBOUNCE_MS) {
+            pdTICKS_TO_MS(now - last_change) >= VP_INPUT_DEBOUNCE_MS)
+        {
             stable_level = sample;
 
-            if (stable_level == VP_BUTTON_ACTIVE_LEVEL) {
+            if (stable_level == VP_BUTTON_ACTIVE_LEVEL)
+            {
                 press_start = now;
                 long_reported = false;
                 ESP_LOGI(TAG, "按键按下");
-            } else {
+            }
+            else
+            {
                 ESP_LOGI(TAG, "按键释放");
-                if (!long_reported) {
+                if (!long_reported)
+                {
                     if (click_count == 1 &&
-                        pdTICKS_TO_MS(now - last_release) > VP_BUTTON_DOUBLE_CLICK_MS) {
+                        pdTICKS_TO_MS(now - last_release) > VP_BUTTON_DOUBLE_CLICK_MS)
+                    {
                         click_count = 0;
                     }
                     TickType_t previous_release = last_release;
                     click_count++;
                     last_release = now;
                     if (click_count >= 2 && previous_release != 0 &&
-                        pdTICKS_TO_MS(now - previous_release) <= VP_BUTTON_DOUBLE_CLICK_MS) {
+                        pdTICKS_TO_MS(now - previous_release) <= VP_BUTTON_DOUBLE_CLICK_MS)
+                    {
                         click_count = 0;
                         ESP_LOGI(TAG, "按键双击");
                         post_button_event(VP_APP_EVENT_BUTTON_DOUBLE);
@@ -107,7 +125,8 @@ static void button_task(void *arg)
         }
 
         if (stable_level == VP_BUTTON_ACTIVE_LEVEL && !long_reported &&
-            pdTICKS_TO_MS(now - press_start) >= VP_BUTTON_LONG_PRESS_MS) {
+            pdTICKS_TO_MS(now - press_start) >= VP_BUTTON_LONG_PRESS_MS)
+        {
             long_reported = true;
             click_count = 0;
             ESP_LOGI(TAG, "按键长按");
@@ -115,7 +134,8 @@ static void button_task(void *arg)
         }
 
         if (click_count == 1 && stable_level != VP_BUTTON_ACTIVE_LEVEL &&
-            pdTICKS_TO_MS(now - last_release) > VP_BUTTON_DOUBLE_CLICK_MS) {
+            pdTICKS_TO_MS(now - last_release) > VP_BUTTON_DOUBLE_CLICK_MS)
+        {
             click_count = 0;
             ESP_LOGI(TAG, "按键单击");
             post_button_event(VP_APP_EVENT_BUTTON_SINGLE);

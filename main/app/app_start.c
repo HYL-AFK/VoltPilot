@@ -15,17 +15,25 @@
 #include "fault_service.h"
 #include "stc_service.h"
 #include "ui_service.h"
+#include "usb_diag_service.h"
 #include "watchdog_service.h"
 #include "vp_board.h"
 #include "vp_types.h"
 
 static const char *TAG = VP_APP_TAG;
 
+static void configure_default_log_levels(void)
+{
+    /* 客户现场默认只保留启动、状态、故障和通信异常，轮询明细按需再开启。 */
+    esp_log_level_set("*", ESP_LOG_WARN);
+    esp_log_level_set(TAG, ESP_LOG_INFO);
+    esp_log_level_set("app_state", ESP_LOG_INFO);
+    esp_log_level_set("usb_diag", ESP_LOG_INFO);
+}
+
 void app_main_start(void)
 {
-    /* BMS RS485 联调阶段：暂时只保留 BMS 服务日志。 */
-    esp_log_level_set("*", ESP_LOG_NONE);
-    esp_log_level_set("bms_service", ESP_LOG_INFO);
+    configure_default_log_levels();
 
     ESP_LOGI(TAG, "VoltPilot boot start");
 
@@ -46,6 +54,14 @@ void app_main_start(void)
         ESP_LOGE(TAG, "diag service init failed: %s", esp_err_to_name(err));
         return;
     }
+
+#if VP_ENABLE_USB_DIAG_SERVICE
+    err = usb_diag_service_init();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "USB diagnostic service init failed: %s", esp_err_to_name(err));
+        return;
+    }
+#endif
 
     err = watchdog_service_init();
     if (err != ESP_OK) {
@@ -118,6 +134,7 @@ void app_main_start(void)
 
     ESP_LOGI(TAG, "VoltPilot services started");
     while (true) {
-        vTaskDelay(pdMS_TO_TICKS(60000));
+        (void)diag_service_tick();
+        vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }

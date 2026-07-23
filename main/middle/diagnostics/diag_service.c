@@ -12,6 +12,7 @@
 #include "esp_log.h"
 #include "esp_system.h"
 #include "ai_rs485_service.h"
+#include "runtime_history.h"
 #include "nvs.h"
 #include "nvs_flash.h"
 #include "freertos/FreeRTOS.h"
@@ -26,10 +27,10 @@
 #define DIAG_ERROR_SAVE_INTERVAL_MS 5000U
 #define RUNTIME_NAMESPACE "vp_runtime"
 #define RUNTIME_META_KEY "meta"
+#define RUNTIME_SUMMARY_KEY "summary"
 #define RUNTIME_RECORD_COUNT 32U
-#define RUNTIME_RECORD_INTERVAL_MS 60000U
 #define RUNTIME_MAGIC 0x56505248U
-#define RUNTIME_VERSION 1U
+#define RUNTIME_VERSION 2U
 
 typedef struct __attribute__((packed)) {
     uint32_t magic;
@@ -44,30 +45,14 @@ typedef struct __attribute__((packed)) {
 } runtime_meta_t;
 
 typedef struct __attribute__((packed)) {
-    uint32_t sequence;
-    uint32_t uptime_ms;
-    uint32_t timestamp;
-    uint32_t boot_count;
-    uint8_t app_state;
-    uint8_t fault_code;
-    uint8_t gear;
-    uint8_t gear_valid;
-    uint8_t stc_online;
-    uint8_t bms_online;
-    uint8_t ai_online;
-    uint8_t en_state;
-    uint16_t stc_io_inputs;
-    uint16_t stc_io_outputs;
-    uint16_t ai_raw[4];
-    uint16_t adc_mv[4];
-    uint32_t stc_timeout_count;
-    uint32_t bms_timeout_count;
-    uint32_t ai_timeout_count;
-    uint8_t reserved[4];
+    vp_runtime_history_record_t record;
     uint32_t crc32;
 } runtime_record_t;
 
-_Static_assert(sizeof(runtime_record_t) == 64, "runtime record must be 64 bytes");
+typedef struct __attribute__((packed)) {
+    vp_runtime_history_summary_t summary;
+    uint32_t crc32;
+} runtime_summary_record_t;
 
 typedef struct {
     uint32_t magic;
@@ -86,8 +71,8 @@ static uint32_t s_last_bg_save_ms;
 static uint32_t s_last_error_save_ms;
 static nvs_handle_t s_runtime_nvs;
 static runtime_meta_t s_runtime_meta;
-static uint32_t s_last_runtime_save_ms;
 static vp_diag_registers_t s_regs;
+static vp_runtime_history_t s_runtime_history;
 
 static uint32_t now_ms(void)
 {
@@ -135,57 +120,108 @@ static esp_err_t save_runtime_meta(void)
     return nvs_commit(s_runtime_nvs);
 }
 
-static esp_err_t save_runtime_record(uint32_t tick_ms)
+static uint32_t runtime_summary_crc(const runtime_summary_record_t *record)
 {
-    if ((tick_ms - s_last_runtime_save_ms) < RUNTIME_RECORD_INTERVAL_MS &&
-        s_runtime_meta.next_sequence != 0) {
-        return ESP_OK;
-    }
+    runtime_summary_record_t copy = *record;
+    copy.crc32 = 0;
+    return crc32_update(0, (const uint8_t *)&copy, sizeof(copy));
+}
 
-    ai_rs485_snapshot_t ai = {0};
-    (void)ai_rs485_service_get_snapshot(&ai);
-    time_t wall_time = time(NULL);
-
-    runtime_record_t record = {
-        .sequence = ++s_runtime_meta.next_sequence,
-        .uptime_ms = tick_ms,
-        .timestamp = wall_time >= 1577836800 ? (uint32_t)wall_time : 0,
-        .boot_count = s_regs.boot_count,
-        .app_state = s_regs.app_state,
-        .fault_code = s_regs.fault_code,
-        .gear = s_regs.stc_raw_gear,
-        .gear_valid = s_regs.stc_gear_valid,
-        .stc_online = s_regs.stc_online,
-        .bms_online = s_regs.bms_online,
-        .ai_online = ai.online,
-        .en_state = (uint8_t)((s_regs.en_24v ? 1U : 0U) |
-                              (s_regs.en_36v ? 2U : 0U) |
-                              (s_regs.en_48v ? 4U : 0U)),
-        .stc_io_inputs = s_regs.stc_io_inputs,
-        .stc_io_outputs = s_regs.stc_io_outputs,
-        .stc_timeout_count = s_regs.stc_timeout_count,
-        .bms_timeout_count = s_regs.bms_timeout_count,
-        .ai_timeout_count = ai.timeout_count,
-    };
-
-    for (size_t i = 0; i < 4; i++) {
-        record.ai_raw[i] = ai.raw[i];
-        record.adc_mv[i] = (uint16_t)(s_regs.adc[i].bus_mv > UINT16_MAX ?
-                                      UINT16_MAX : s_regs.adc[i].bus_mv);
-    }
+static esp_err_t save_runtime_record(vp_runtime_history_record_t *record)
+{
+    runtime_record_t stored = {0};
+    record->sequence = ++s_runtime_meta.next_sequence;
+    stored.record = *record;
 
     char key[8];
     runtime_record_key(s_runtime_meta.head, key, sizeof(key));
-    record.crc32 = runtime_record_crc(&record);
-    ESP_RETURN_ON_ERROR(nvs_set_blob(s_runtime_nvs, key, &record, sizeof(record)),
+    stored.crc32 = runtime_record_crc(&stored);
+    ESP_RETURN_ON_ERROR(nvs_set_blob(s_runtime_nvs, key, &stored, sizeof(stored)),
                         TAG, "write runtime record failed");
 
     s_runtime_meta.head = (uint16_t)((s_runtime_meta.head + 1U) % RUNTIME_RECORD_COUNT);
     if (s_runtime_meta.count < RUNTIME_RECORD_COUNT) {
         s_runtime_meta.count++;
     }
-    s_last_runtime_save_ms = tick_ms;
-    return save_runtime_meta();
+    ESP_RETURN_ON_ERROR(save_runtime_meta(), TAG, "commit runtime record failed");
+    vp_runtime_history_mark_persisted(&s_runtime_history, record);
+    return ESP_OK;
+}
+
+static esp_err_t save_runtime_summary(const vp_runtime_history_summary_t *summary)
+{
+    runtime_summary_record_t stored = {
+        .summary = *summary,
+    };
+    stored.crc32 = runtime_summary_crc(&stored);
+    ESP_RETURN_ON_ERROR(nvs_set_blob(s_runtime_nvs, RUNTIME_SUMMARY_KEY, &stored, sizeof(stored)),
+                        TAG, "write runtime summary failed");
+    return nvs_commit(s_runtime_nvs);
+}
+
+static vp_runtime_history_record_t build_runtime_record(uint32_t tick_ms, bool event,
+                                                        uint32_t event_code)
+{
+    ai_rs485_snapshot_t ai = {0};
+    (void)ai_rs485_service_get_snapshot(&ai);
+    time_t wall_time = time(NULL);
+    uint16_t status = 0;
+    status |= s_regs.stc_online ? (1U << 0) : 0U;
+    status |= s_regs.bms_online ? (1U << 1) : 0U;
+    status |= ai.online ? (1U << 2) : 0U;
+    status |= s_regs.stc_gear_valid ? (1U << 3) : 0U;
+    status |= s_regs.en_24v ? (1U << 4) : 0U;
+    status |= s_regs.en_36v ? (1U << 5) : 0U;
+    status |= s_regs.en_48v ? (1U << 6) : 0U;
+
+    vp_runtime_history_record_t record = {
+        .uptime_ms = tick_ms,
+        .timestamp = wall_time >= 1577836800 ? (uint32_t)wall_time : 0,
+        .event_code = event_code,
+        .pack_mv = s_regs.bms_pack_mv,
+        .current_ma = s_regs.bms_current_ma,
+        .status_flags = status,
+        .record_type = event ? VP_RUNTIME_HISTORY_RECORD_EVENT :
+                               VP_RUNTIME_HISTORY_RECORD_SNAPSHOT,
+        .app_state = s_regs.app_state,
+        .fault_code = s_regs.fault_code,
+        .gear = s_regs.stc_raw_gear,
+        .soc_percent = s_regs.bms_rsoc_percent,
+    };
+    for (size_t i = 0; i < 4; i++) {
+        record.user_data[i * 2U] = (uint8_t)(ai.raw[i] >> 8);
+        record.user_data[i * 2U + 1U] = (uint8_t)ai.raw[i];
+        record.user_data[8U + i * 2U] = (uint8_t)(s_regs.adc[i].bus_mv >> 8);
+        record.user_data[9U + i * 2U] = (uint8_t)s_regs.adc[i].bus_mv;
+    }
+    return record;
+}
+
+static esp_err_t capture_runtime_record(bool force_event, uint32_t event_code)
+{
+    if (!s_inited) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    vp_runtime_history_record_t record = build_runtime_record(now_ms(), force_event, event_code);
+    if (!force_event) {
+        vp_runtime_history_record_t latest = {0};
+        if (vp_runtime_history_get_latest(&s_runtime_history, &latest) &&
+            (record.uptime_ms - latest.uptime_ms) < 1000U) {
+            return ESP_OK;
+        }
+    }
+    (void)vp_runtime_history_push_ram(&s_runtime_history, &record);
+    vp_runtime_history_observe(&s_runtime_history, &record);
+    if (vp_runtime_history_should_persist(&s_runtime_history, &record, force_event)) {
+        ESP_RETURN_ON_ERROR(save_runtime_record(&record), TAG, "save runtime record failed");
+    }
+    if (vp_runtime_history_summary_due(&s_runtime_history, record.uptime_ms)) {
+        vp_runtime_history_summary_t summary = {0};
+        if (vp_runtime_history_take_summary(&s_runtime_history, record.uptime_ms, &summary)) {
+            ESP_RETURN_ON_ERROR(save_runtime_summary(&summary), TAG, "save runtime summary failed");
+        }
+    }
+    return ESP_OK;
 }
 
 static esp_err_t init_runtime_history(void)
@@ -261,7 +297,6 @@ static esp_err_t save_snapshot(bool force)
     ESP_RETURN_ON_ERROR(nvs_set_blob(s_nvs, key, &slot, sizeof(slot)), TAG, "write diag slot failed");
     ESP_RETURN_ON_ERROR(nvs_commit(s_nvs), TAG, "commit diag slot failed");
     s_last_bg_save_ms = tick_ms;
-    ESP_RETURN_ON_ERROR(save_runtime_record(tick_ms), TAG, "save runtime history failed");
     ESP_LOGI(TAG, "诊断寄存器已保存 key=%s seq=%" PRIu32, key, slot.seq);
     return ESP_OK;
 }
@@ -327,16 +362,66 @@ esp_err_t diag_service_init(void)
     strlcpy(s_regs.app_version, app != NULL ? app->version : "unknown", sizeof(s_regs.app_version));
     s_regs.min_free_heap = heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT);
 
+    vp_runtime_history_init(&s_runtime_history);
     s_inited = true;
     ESP_LOGI(TAG, "诊断寄存器初始化 boot=%" PRIu32 " reset=%d last_wdt=%d prev_valid=%d",
              s_regs.boot_count, reason, s_regs.last_boot_wdt, latest != NULL);
     return save_snapshot(true);
 }
 
+esp_err_t diag_service_tick(void)
+{
+    return capture_runtime_record(false, 0);
+}
+
 esp_err_t diag_service_get_snapshot(vp_diag_registers_t *out_snapshot)
 {
     ESP_RETURN_ON_FALSE(out_snapshot != NULL, ESP_ERR_INVALID_ARG, TAG, "snapshot null");
     *out_snapshot = s_regs;
+    return ESP_OK;
+}
+
+size_t diag_service_runtime_history_count(void)
+{
+    return s_inited ? s_runtime_meta.count : 0;
+}
+
+esp_err_t diag_service_get_runtime_history(size_t index, vp_runtime_history_record_t *out_record)
+{
+    ESP_RETURN_ON_FALSE(s_inited && out_record != NULL, ESP_ERR_INVALID_ARG, TAG,
+                        "runtime history unavailable");
+    ESP_RETURN_ON_FALSE(index < s_runtime_meta.count, ESP_ERR_NOT_FOUND, TAG,
+                        "runtime history index out of range");
+
+    uint16_t oldest = (uint16_t)((s_runtime_meta.head + RUNTIME_RECORD_COUNT -
+                                  s_runtime_meta.count) % RUNTIME_RECORD_COUNT);
+    uint16_t slot = (uint16_t)((oldest + index) % RUNTIME_RECORD_COUNT);
+    char key[8];
+    runtime_record_key(slot, key, sizeof(key));
+    runtime_record_t stored = {0};
+    size_t len = sizeof(stored);
+    ESP_RETURN_ON_ERROR(nvs_get_blob(s_runtime_nvs, key, &stored, &len), TAG,
+                        "read runtime history failed");
+    ESP_RETURN_ON_FALSE(len == sizeof(stored) && stored.crc32 == runtime_record_crc(&stored),
+                        ESP_ERR_INVALID_CRC, TAG, "runtime history crc invalid");
+    *out_record = stored.record;
+    return ESP_OK;
+}
+
+esp_err_t diag_service_get_runtime_summary(vp_runtime_history_summary_t *out_summary)
+{
+    ESP_RETURN_ON_FALSE(s_inited && out_summary != NULL, ESP_ERR_INVALID_ARG, TAG,
+                        "runtime summary unavailable");
+    runtime_summary_record_t stored = {0};
+    size_t len = sizeof(stored);
+    esp_err_t err = nvs_get_blob(s_runtime_nvs, RUNTIME_SUMMARY_KEY, &stored, &len);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        return ESP_ERR_NOT_FOUND;
+    }
+    ESP_RETURN_ON_ERROR(err, TAG, "read runtime summary failed");
+    ESP_RETURN_ON_FALSE(len == sizeof(stored) && stored.crc32 == runtime_summary_crc(&stored),
+                        ESP_ERR_INVALID_CRC, TAG, "runtime summary crc invalid");
+    *out_summary = stored.summary;
     return ESP_OK;
 }
 
@@ -347,7 +432,17 @@ esp_err_t diag_service_record_fault(vp_fault_code_t code, const char *source)
     }
     s_regs.fault_code = (uint8_t)code;
     strlcpy(s_regs.fault_source, source != NULL ? source : "unknown", sizeof(s_regs.fault_source));
+    ESP_RETURN_ON_ERROR(capture_runtime_record(true, (uint32_t)code), TAG,
+                        "save fault runtime record failed");
     return save_snapshot(true);
+}
+
+esp_err_t diag_service_record_event(uint32_t event_code)
+{
+    ESP_RETURN_ON_FALSE(event_code != 0U, ESP_ERR_INVALID_ARG, TAG, "event code invalid");
+    ESP_RETURN_ON_ERROR(capture_runtime_record(true, event_code), TAG,
+                        "save diagnostic runtime event failed");
+    return save_snapshot(false);
 }
 
 esp_err_t diag_service_capture_fault_outputs(board_output_state_t outputs)
@@ -363,20 +458,34 @@ esp_err_t diag_service_update_state(vp_app_state_t state,
                                     const char *fault_source,
                                     board_output_state_t outputs)
 {
+    bool state_changed = s_regs.app_state != (uint8_t)state ||
+                         s_regs.fault_code != (uint8_t)fault ||
+                         s_regs.en_24v != outputs.en_24v ||
+                         s_regs.en_36v != outputs.en_36v ||
+                         s_regs.en_48v != outputs.en_48v;
     s_regs.app_state = (uint8_t)state;
     s_regs.fault_code = (uint8_t)fault;
     strlcpy(s_regs.fault_source, fault_source != NULL ? fault_source : "none", sizeof(s_regs.fault_source));
     s_regs.en_24v = outputs.en_24v;
     s_regs.en_36v = outputs.en_36v;
     s_regs.en_48v = outputs.en_48v;
+    ESP_RETURN_ON_ERROR(capture_runtime_record(state_changed, (uint32_t)fault), TAG,
+                        "save state runtime record failed");
     return save_snapshot(fault != VP_FAULT_NONE);
 }
 
 esp_err_t diag_service_update_outputs(board_output_state_t outputs)
 {
+    bool changed = s_regs.en_24v != outputs.en_24v ||
+                   s_regs.en_36v != outputs.en_36v ||
+                   s_regs.en_48v != outputs.en_48v;
     s_regs.en_24v = outputs.en_24v;
     s_regs.en_36v = outputs.en_36v;
     s_regs.en_48v = outputs.en_48v;
+    if (changed) {
+        ESP_RETURN_ON_ERROR(capture_runtime_record(true, 0), TAG,
+                            "save output runtime record failed");
+    }
     return save_snapshot(true);
 }
 
